@@ -8,7 +8,7 @@ function resolveBranchId(req) {
 
   if (role === "STAFF") return userBranchId; // khóa theo token
 
-  // admin/manager
+  // admin/manager//
   if (!qBranch || qBranch === "all" || qBranch === "null") return null;
 
   if (!mongoose.isValidObjectId(qBranch)) return null;
