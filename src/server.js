@@ -24,9 +24,9 @@ async function main() {
     });
   });
 
-  server.listen(env.PORT, () => {
-    console.log(`Server running :${env.PORT}`);
-  });
+  server.listen(env.PORT, "0.0.0.0", () => {
+  console.log(`Server running :${env.PORT}`);
+});
 }
 
 main().catch((e) => {
