@@ -51,7 +51,6 @@ async function buildOrderItems(itemsIn) {
  * returns allocations: [{ branchId, productId, qty }]
  */
 async function allocatePosStockSingleBranch({ branchId, items }) {
-  // items: [{ productId, qty }]
   const allocations = [];
   for (const it of items) {
     const need = Number(it.qty || 0);
@@ -68,14 +67,23 @@ async function allocatePosStockSingleBranch({ branchId, items }) {
 }
 
 /**
+ * Helper: subtract stock by allocations
+ */
+async function applyStockDelta(allocations, sign /* -1 subtract, +1 restore */) {
+  for (const al of allocations || []) {
+    const qty = Number(al.qty || 0) * Number(sign || 0);
+    if (!al.branchId || !al.productId || !qty) continue;
+
+    await Stock.findOneAndUpdate(
+      { branchId: al.branchId, productId: al.productId },
+      { $inc: { qty } },
+      { upsert: true, new: true }
+    );
+  }
+}
+
+/**
  * GET /api/orders
- * Query:
- * - q: search code/phone/name
- * - channel: POS|ONLINE
- * - status: PENDING|CONFIRM|SHIPPED|CANCELLED|REFUNDED
- * - branchId
- * - dateFrom, dateTo: ISO string
- * - page, limit
  */
 router.get(
   "/",
@@ -106,7 +114,6 @@ router.get(
     }
 
     if (q) {
-      // search theo code hoặc delivery.receiverPhone hoặc customer phone (nếu bạn có populate sau)
       filter.$or = [
         { code: { $regex: q, $options: "i" } },
         { "delivery.receiverPhone": { $regex: q, $options: "i" } },
@@ -145,17 +152,17 @@ router.get(
 
 /**
  * POST /api/orders
- * Tạo đơn nội bộ (POS hoặc ONLINE-admin). Online khách dùng /api/checkout.
- * Body:
- * {
- *   channel: "POS"|"ONLINE",
- *   branchId?: "...",            // POS bắt buộc; ONLINE thường = MAIN_BRANCH_ID để hiển thị
- *   customer?: { phone, name, email } (optional),
- *   delivery?: { method, address, note } (optional),
- *   items: [{ productId, qty }]
- * }
+ * Tạo đơn nội bộ (POS hoặc ONLINE-admin).
  *
- * => luôn tạo PENDING (KHÔNG trừ kho)
+ * ✅ PATCH theo yêu cầu:
+ * - Cho phép body.status: "PENDING" | "CONFIRM" (optional)
+ * - POS:
+ *    - PENDING: TRỪ KHO NGAY (theo branchId) ✅
+ *    - CONFIRM: TRỪ KHO NGAY + lưu confirmedAt + validate payment ✅
+ * - ONLINE:
+ *    - luôn tạo PENDING (không trừ kho), nếu gửi status=CONFIRM thì sẽ bị chặn (bắt dùng /confirm)
+ *
+ * - Pricing: discount/extraFee => total = subtotal - discount + extraFee ✅
  */
 router.post(
   "/",
@@ -164,14 +171,18 @@ router.post(
     const body = z
       .object({
         channel: z.enum(["POS", "ONLINE"]),
+        status: z.enum(["PENDING", "CONFIRM"]).optional(),
+
         branchId: z.string().optional(),
+
         customer: z
           .object({
-            phone: z.string().min(8),
+            phone: z.string().optional(), // ✅ cho phép vãng lai (không cần phone)
             name: z.string().optional(),
             email: z.string().optional(),
           })
           .optional(),
+
         delivery: z
           .object({
             method: z.enum(["SHIP", "PICKUP"]).optional(),
@@ -179,6 +190,19 @@ router.post(
             note: z.string().optional(),
           })
           .optional(),
+
+        // ✅ NEW PRICING
+        discount: z.number().nonnegative().optional(),
+        extraFee: z.number().nonnegative().optional(),
+        pricingNote: z.string().optional(),
+
+        payment: z
+          .object({
+            method: z.enum(["CASH", "BANK", "CARD", "COD", "WALLET", "PENDING"]).optional(),
+            amount: z.number().nonnegative().optional(),
+          })
+          .optional(),
+
         items: z
           .array(
             z.object({
@@ -193,11 +217,32 @@ router.post(
     if (!body.success) return res.status(400).json({ ok: false, error: body.error.flatten() });
     const data = body.data;
 
+    // defaults
+    const requestedStatus = data.status || "PENDING";
+
+    // POS requires branchId
     if (data.channel === "POS" && !data.branchId) {
       return res.status(400).json({ ok: false, message: "POS order requires branchId" });
     }
 
-    // upsert customer if provided
+    // ONLINE: không cho create CONFIRM ở endpoint này để tránh bypass rule trừ kho
+    if (data.channel === "ONLINE" && requestedStatus === "CONFIRM") {
+      return res.status(409).json({ ok: false, message: "ONLINE cannot be created as CONFIRM here. Create PENDING then POST /api/orders/:id/confirm" });
+    }
+
+    // Delivery normalize
+    const delMethod = data.delivery?.method || "SHIP";
+    const receiverName = String(data.customer?.name || "").trim();
+    const receiverPhone = String(data.customer?.phone || "").trim();
+
+    // ✅ Rule: nếu SHIP thì bắt buộc phone + address (cho cả POS/ONLINE nếu bạn dùng ship)
+    if (delMethod === "SHIP") {
+      const addr = String(data.delivery?.address || "").trim();
+      if (!addr) return res.status(400).json({ ok: false, message: "SHIP requires delivery.address" });
+      if (!receiverPhone) return res.status(400).json({ ok: false, message: "SHIP requires customer.phone" });
+    }
+
+    // upsert customer if provided phone
     let customerId = null;
     if (data.customer?.phone) {
       const c = await Customer.findOneAndUpdate(
@@ -209,33 +254,87 @@ router.post(
     }
 
     const items = await buildOrderItems(data.items);
-    const subtotal = items.reduce((s, it) => s + it.total, 0);
+    const subtotal = items.reduce((s, it) => s + Number(it.total || 0), 0);
 
+    const discount = Number(data.discount || 0);
+    const extraFee = Number(data.extraFee || 0);
+
+    if (discount > subtotal) {
+      return res.status(400).json({ ok: false, message: `discount cannot exceed subtotal (${subtotal})` });
+    }
+
+    const total = subtotal - discount + extraFee;
+
+    // ✅ payments snapshot
+    const payments = [];
+    const incomingPayment = data.payment || null;
+
+    // POS CONFIRM: phải có payment CASH/BANK/CARD/WALLET và amount == total
+    // POS PENDING: cho phép payment.method = PENDING hoặc không gửi
+    if (data.channel === "POS") {
+      if (requestedStatus === "CONFIRM") {
+        if (!incomingPayment?.method) {
+          return res.status(400).json({ ok: false, message: "POS CONFIRM requires payment.method" });
+        }
+        if (incomingPayment.method === "COD") {
+          return res.status(400).json({ ok: false, message: "POS không dùng COD" });
+        }
+        if (incomingPayment.method === "PENDING") {
+          return res.status(400).json({ ok: false, message: "POS CONFIRM cannot use PENDING payment method" });
+        }
+
+        const amt = Number(incomingPayment.amount || 0);
+        if (amt !== total) {
+          return res.status(400).json({ ok: false, message: `POS payment requires amount == order.total (${total})` });
+        }
+        payments.push({ method: incomingPayment.method, amount: amt });
+      } else {
+        // PENDING
+        // nếu bạn muốn lưu payment pending:
+        if (incomingPayment?.method && incomingPayment.method !== "PENDING") {
+          // không cho nhét CASH/BANK vào PENDING tránh báo cáo sai
+          return res.status(400).json({ ok: false, message: "POS PENDING chỉ cho payment.method=PENDING hoặc bỏ trống" });
+        }
+        if (incomingPayment?.method === "PENDING") {
+          payments.push({ method: "PENDING", amount: Number(incomingPayment.amount || 0) });
+        }
+      }
+    } else {
+      // ONLINE create: luôn PENDING và không cần payment
+      // (payment sẽ được xử lý ở /confirm)
+    }
+
+    // ✅ create order first
     const order = await Order.create({
       code: genOrderCode(data.channel === "POS" ? "POS" : "ADM"),
       channel: data.channel,
-      status: "PENDING",
+
+      // ✅ status by request (POS only)
+      status: requestedStatus,
 
       branchId: data.branchId || null,
       customerId,
 
       subtotal,
-      discount: 0,
-      total: subtotal,
+      discount,
+      extraFee,
+      total,
+      pricingNote: data.pricingNote || "",
 
       items,
-      payments: [],
+      payments,
+
       delivery: {
-        method: data.delivery?.method || "SHIP",
+        method: delMethod,
         address: data.delivery?.address || "",
-        receiverName: data.customer?.name || "",
-        receiverPhone: data.customer?.phone || "",
+        receiverName,
+        receiverPhone,
         note: data.delivery?.note || "",
       },
 
       createdById: req.user.sub || null,
 
-      // PENDING => chưa trừ kho
+      // will be filled if POS subtract stock now
       stockAllocations: [],
       confirmedAt: null,
       confirmedById: null,
@@ -244,7 +343,33 @@ router.post(
       refundNote: "",
     });
 
-    res.json({ ok: true, order });
+    // =========================
+    // ✅ STOCK RULES (PATCH)
+    // =========================
+    // POS: PENDING cũng trừ kho, CONFIRM cũng trừ kho.
+    // ONLINE: create PENDING không trừ kho.
+    if (data.channel === "POS") {
+      const needItems = order.items.map((x) => ({ productId: x.productId, qty: x.qty }));
+
+      const allocations = await allocatePosStockSingleBranch({
+        branchId: String(order.branchId),
+        items: needItems,
+      });
+
+      // subtract now
+      await applyStockDelta(allocations, -1);
+
+      order.stockAllocations = allocations;
+
+      if (requestedStatus === "CONFIRM") {
+        order.confirmedAt = new Date();
+        order.confirmedById = req.user.sub || null;
+      }
+
+      await order.save();
+    }
+
+    res.json({ ok: true, order: order.toObject() });
   })
 );
 
@@ -252,12 +377,12 @@ router.post(
  * POST /api/orders/:id/confirm
  * ✅ PENDING -> CONFIRM: TRỪ KHO
  * - ONLINE: allocate MAIN trước, thiếu trừ kho phụ
- * - POS: trừ đúng branchId của order
+ * - POS: trừ đúng branchId của order (idempotent)
  */
 router.post(
   "/:id/confirm",
   authRequired,
-  requireRole(["ADMIN", "MANAGER", "CASHIER", "STAFF"]), // POS nhân viên confirm được
+  requireRole(["ADMIN", "MANAGER", "CASHIER", "STAFF"]),
   asyncHandler(async (req, res) => {
     const mainBranchId = String(process.env.MAIN_BRANCH_ID || "").trim();
     if (!mainBranchId) return res.status(500).json({ ok: false, message: "Missing MAIN_BRANCH_ID in .env" });
@@ -287,14 +412,13 @@ router.post(
     }
 
     const totalAmount = Number(order.total || 0);
-    const incomingPayment = body.data.payment; // optional
+    const incomingPayment = body.data.payment;
     order.payments = Array.isArray(order.payments) ? order.payments : [];
 
     // =========================
     // 1) PAYMENT RULES
     // =========================
     if (order.channel === "ONLINE") {
-      // ONLINE: prepay optional, nếu không có thì auto COD
       if (incomingPayment) {
         if (incomingPayment.method === "CASH") {
           return res.status(400).json({ ok: false, message: "ONLINE không dùng CASH" });
@@ -316,7 +440,7 @@ router.post(
         order.payments.push({ method: "COD", amount: totalAmount });
       }
     } else {
-      // POS: bắt buộc có payment tại confirm (hoặc đã nhập trước đó)
+      // POS confirm: nếu tạo PENDING trước mà đã trừ kho, confirm chỉ cần validate payment
       if (order.payments.length === 0) {
         if (!incomingPayment) {
           return res.status(400).json({
@@ -335,7 +459,6 @@ router.post(
         }
         order.payments.push({ method: incomingPayment.method, amount: incomingPayment.amount });
       } else {
-        // đã có payment trước đó -> validate tổng tiền
         const sumPaid = order.payments.reduce((s, p) => s + Number(p.amount || 0), 0);
         if (sumPaid !== totalAmount) {
           return res.status(400).json({
@@ -349,58 +472,50 @@ router.post(
     // =========================
     // 2) ALLOCATE & SUBTRACT STOCK
     // =========================
-    const needItems = order.items.map((x) => ({ productId: x.productId, qty: x.qty }));
-    let allocations = [];
+    // ✅ PATCH: nếu POS đã trừ kho ngay lúc create (stockAllocations có rồi) thì KHÔNG trừ lại
+    const hasAlloc = Array.isArray(order.stockAllocations) && order.stockAllocations.length > 0;
 
-    if (order.channel === "ONLINE") {
-      allocations = await allocateOnlineStock({ mainBranchId, items: needItems });
-    } else {
-      if (!order.branchId) return res.status(400).json({ ok: false, message: "POS order missing branchId" });
+    if (!hasAlloc) {
+      const needItems = order.items.map((x) => ({ productId: x.productId, qty: x.qty }));
+      let allocations = [];
 
-      // POS: trừ đúng branchId
-      allocations = await allocatePosStockSingleBranch({
-        branchId: order.branchId,
-        items: needItems,
-      });
-    }
+      if (order.channel === "ONLINE") {
+        allocations = await allocateOnlineStock({ mainBranchId, items: needItems });
+      } else {
+        if (!order.branchId) return res.status(400).json({ ok: false, message: "POS order missing branchId" });
+        allocations = await allocatePosStockSingleBranch({
+          branchId: order.branchId,
+          items: needItems,
+        });
+      }
 
-    for (const al of allocations) {
-      await Stock.findOneAndUpdate(
-        { branchId: al.branchId, productId: al.productId },
-        { $inc: { qty: -al.qty } },
-        { upsert: true, new: true }
-      );
+      await applyStockDelta(allocations, -1);
+      order.stockAllocations = allocations;
     }
 
     // =========================
     // 3) UPDATE ORDER STATUS
     // =========================
     order.status = "CONFIRM";
-    order.stockAllocations = allocations;
     order.confirmedAt = new Date();
     order.confirmedById = req.user.sub || null;
 
     await order.save();
-
     res.json({ ok: true, order: order.toObject() });
   })
 );
 
-
 /**
  * PATCH /api/orders/:id/status
- * Rule theo yêu cầu:
- * - PENDING -> CANCELLED: ✅ chỉ đổi status, không đụng kho
- * - CONFIRM -> SHIPPED: ✅
- * - SHIPPED -> REFUNDED: ✅ (KHÔNG hoàn kho tự động, bạn nhập lại bằng phiếu)
- * - Terminal: CANCELLED/REFUNDED không đổi nữa
+ * PATCH theo yêu cầu:
+ * - POS: nếu đơn đã trừ kho (stockAllocations có) và chuyển -> CANCELLED => HOÀN KHO ✅
+ * - ONLINE: giữ như cũ: PENDING->CANCELLED không đụng kho (vì chưa trừ) ✅
  *
- * Note: không cho set CONFIRM ở đây (phải dùng /confirm để trừ kho).
+ * Note: không cho set CONFIRM ở đây (phải dùng /confirm hoặc create status=CONFIRM với POS).
  */
 router.patch(
   "/:id/status",
   authRequired,
-  // requireRole(["ADMIN", "MANAGER"]),
   asyncHandler(async (req, res) => {
     const body = z
       .object({
@@ -423,9 +538,12 @@ router.patch(
       return res.status(409).json({ ok: false, message: `Cannot change status from ${prev}` });
     }
 
-    // CONFIRM must go through /confirm
+    // CONFIRM must go through /confirm (or create POS with status=CONFIRM)
     if (next === "CONFIRM") {
-      return res.status(409).json({ ok: false, message: "Use POST /api/orders/:id/confirm to CONFIRM (it subtracts stock)" });
+      return res.status(409).json({
+        ok: false,
+        message: "Use POST /api/orders/:id/confirm to CONFIRM (it subtracts stock) OR create POS order with status=CONFIRM",
+      });
     }
 
     // Allowed transitions
@@ -439,6 +557,21 @@ router.patch(
       return res.status(409).json({ ok: false, message: `Invalid transition ${prev} -> ${next}` });
     }
 
+    // =========================
+    // ✅ STOCK RESTORE on CANCELLED for POS if already allocated
+    // =========================
+    if (next === "CANCELLED") {
+      const isPOS = String(order.channel || "").toUpperCase() === "POS";
+      const hasAlloc = Array.isArray(order.stockAllocations) && order.stockAllocations.length > 0;
+
+      if (isPOS && hasAlloc) {
+        // restore stock
+        await applyStockDelta(order.stockAllocations, +1);
+        // clear allocations to avoid double-restore
+        order.stockAllocations = [];
+      }
+    }
+
     order.status = next;
 
     if (next === "SHIPPED") {
@@ -448,19 +581,17 @@ router.patch(
     if (next === "REFUNDED") {
       order.refundedAt = new Date();
       order.refundNote = body.data.refundNote || "";
-      // ✅ theo yêu cầu: REFUNDED không auto hoàn kho
+      // giữ đúng yêu cầu: REFUNDED không auto hoàn kho
     }
 
     await order.save();
-
     res.json({ ok: true, order: order.toObject() });
   })
 );
 
 /**
  * POST /api/orders/:id/payment
- * Thêm payment record (không tự đổi status, bạn chủ động đổi nếu cần)
- * Body: { method: CASH|BANK|CARD|COD|WALLET, amount: number }
+ * Thêm payment record (không tự đổi status)
  */
 router.post(
   "/:id/payment",
@@ -478,7 +609,6 @@ router.post(
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ ok: false, message: "Order not found" });
 
-    // Không cho thanh toán khi terminal
     if (order.status === "CANCELLED" || order.status === "REFUNDED") {
       return res.status(409).json({ ok: false, message: `Cannot add payment to ${order.status} order` });
     }
@@ -489,52 +619,30 @@ router.post(
 
     order.payments = Array.isArray(order.payments) ? order.payments : [];
 
-    // ---- RULES BY CHANNEL ----
     if (order.channel === "ONLINE") {
-      // ONLINE: chỉ prepay (BANK/CARD/WALLET) hoặc COD (nếu bạn muốn set COD qua payment)
-      // khuyến nghị: ONLINE không dùng CASH
-      if (method === "CASH") {
-        return res.status(400).json({ ok: false, message: "ONLINE không hỗ trợ CASH" });
-      }
+      if (method === "CASH") return res.status(400).json({ ok: false, message: "ONLINE không hỗ trợ CASH" });
+      if (method === "COD") return res.status(400).json({ ok: false, message: "ONLINE COD sẽ tự set khi CONFIRM (không set qua /payment)" });
 
-      // Nếu muốn: không cho set COD bằng endpoint này, vì confirm sẽ auto COD
-      if (method === "COD") {
-        return res.status(400).json({ ok: false, message: "ONLINE COD sẽ tự set khi CONFIRM (không set qua /payment)" });
-      }
-
-      // Chặn double payment
       if (order.payments.length > 0) {
         return res.status(409).json({ ok: false, message: "ONLINE order đã có payment, không thể thêm nữa" });
       }
 
-      // Prepay thường phải đủ total (muốn cho đặt cọc mình mở rộng sau)
       if (amount !== totalAmount) {
-        return res.status(400).json({
-          ok: false,
-          message: `ONLINE prepay requires amount == order.total (${totalAmount})`,
-        });
+        return res.status(400).json({ ok: false, message: `ONLINE prepay requires amount == order.total (${totalAmount})` });
       }
 
       order.payments.push({ method, amount });
       await order.save();
-
       return res.json({ ok: true, order: order.toObject() });
     }
 
     // POS
-    if (method === "COD") {
-      return res.status(400).json({ ok: false, message: "POS không dùng COD" });
-    }
+    if (method === "COD") return res.status(400).json({ ok: false, message: "POS không dùng COD" });
 
-    // POS thường thu đủ khi ghi payment (để khỏi lệch báo cáo)
     if (amount !== totalAmount) {
-      return res.status(400).json({
-        ok: false,
-        message: `POS payment requires amount == order.total (${totalAmount})`,
-      });
+      return res.status(400).json({ ok: false, message: `POS payment requires amount == order.total (${totalAmount})` });
     }
 
-    // Nếu POS đã có payment thì chặn để tránh double
     if (order.payments.length > 0) {
       return res.status(409).json({ ok: false, message: "POS order đã có payment, không thể thêm nữa" });
     }
@@ -545,6 +653,5 @@ router.post(
     res.json({ ok: true, order: order.toObject() });
   })
 );
-
 
 module.exports = router;

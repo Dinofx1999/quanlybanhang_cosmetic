@@ -14,7 +14,8 @@ const OrderItemSchema = new mongoose.Schema(
 
 const PaymentSchema = new mongoose.Schema(
   {
-    method: { type: String, enum: ["CASH", "BANK", "CARD", "COD", "WALLET"], required: true },
+    // ✅ thêm PENDING để lưu tình trạng chưa thu tiền
+    method: { type: String, enum: ["CASH", "BANK", "CARD", "COD", "WALLET", "PENDING"], required: true },
     amount: { type: Number, required: true },
   },
   { _id: false }
@@ -31,7 +32,9 @@ const DeliverySchema = new mongoose.Schema(
   { _id: false }
 );
 
-// lưu dấu vết TRỪ KHO (chỉ có sau khi CONFIRM)
+// ✅ lưu dấu vết TRỪ/HOÀN KHO
+// - ONLINE: có sau khi CONFIRM
+// - POS: có thể có ngay lúc tạo PENDING/CONFIRM (vì bạn yêu cầu PENDING cũng trừ kho)
 const StockAllocationSchema = new mongoose.Schema(
   {
     branchId: { type: mongoose.Schema.Types.ObjectId, ref: "Branch", required: true },
@@ -47,7 +50,6 @@ const OrderSchema = new mongoose.Schema(
 
     channel: { type: String, enum: ["POS", "ONLINE"], required: true },
 
-    // ✅ 5 trạng thái theo yêu cầu
     status: {
       type: String,
       enum: ["PENDING", "CONFIRM", "SHIPPED", "CANCELLED", "REFUNDED"],
@@ -55,12 +57,17 @@ const OrderSchema = new mongoose.Schema(
       index: true,
     },
 
-    // hiển thị / báo cáo: ONLINE thường gán MAIN, POS gán branch đang bán
     branchId: { type: mongoose.Schema.Types.ObjectId, ref: "Branch", default: null, index: true },
     customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
 
     subtotal: { type: Number, default: 0 },
+
+    // ✅ NEW: discount + extraFee (+ note)
     discount: { type: Number, default: 0 },
+    extraFee: { type: Number, default: 0 },
+    pricingNote: { type: String, default: "" },
+
+    // ✅ total = subtotal - discount + extraFee (routes sẽ tính)
     total: { type: Number, default: 0 },
 
     items: { type: [OrderItemSchema], default: [] },
@@ -69,8 +76,10 @@ const OrderSchema = new mongoose.Schema(
 
     createdById: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
-    // ✅ chỉ được set khi CONFIRM (đã trừ kho)
+    // ✅ set khi đã trừ kho (POS: PENDING/CONFIRM, ONLINE: CONFIRM)
     stockAllocations: { type: [StockAllocationSchema], default: [] },
+
+    // ✅ chỉ set khi CONFIRM
     confirmedAt: { type: Date, default: null },
     confirmedById: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
