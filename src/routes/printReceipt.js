@@ -224,5 +224,5 @@ router.get("/receipt/:orderId", asyncHandler(async (req, res) => {
   
   console.log(`✅ [Print Receipt] Sent HTML for order ${orderNumber}`);
 }));
-
+//OK
 module.exports = router;
