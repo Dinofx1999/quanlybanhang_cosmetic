@@ -8,6 +8,10 @@ const path = require("path"); // ✅ ADD
 const apiRoutes = require("./routes");
 const { env } = require("./config/env");
 const { notFound, errorHandler } = require("./middlewares/error");
+const receiptTpl = require("./routes/receiptTemplates");
+const printReceipt = require("./routes/printReceipt");
+
+
 
 function createApp() {
   const app = express();
@@ -27,6 +31,8 @@ function createApp() {
   app.get("/", (_req, res) => res.send("COSMETICS API OK"));
 
   app.use("/api", apiRoutes);
+
+  app.use("/print", printReceipt);
 
   app.use(notFound);
   app.use(errorHandler);

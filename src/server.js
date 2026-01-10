@@ -4,6 +4,8 @@ const { Server } = require("socket.io");
 const { env } = require("./config/env");
 const { connectDB } = require("./db");
 const { createApp } = require("./app");
+const { seedReceiptTemplate } = require("./seeds/receiptTemplate.seed");
+
 
 async function main() {
   await connectDB();
@@ -23,6 +25,9 @@ async function main() {
       if (branchId) socket.join(`branch:${branchId}`);
     });
   });
+
+   // ✅ seed bill template nếu chưa có
+  await seedReceiptTemplate();
 
   server.listen(env.PORT, "0.0.0.0", () => {
   console.log(`Server running :${env.PORT}`);
