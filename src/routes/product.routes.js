@@ -179,7 +179,8 @@ router.delete(
     const productId = req.params.id;
     if (!isValidObjectId(productId)) return res.status(400).json({ ok: false, message: "INVALID_PRODUCT_ID" });
 
-    const url = String(req.query.url || "").trim();
+    // ✅ Nhận từ cả query hoặc body
+    const url = String(req.query.url || req.body.url || "").trim();
     if (!url) return res.status(400).json({ ok: false, message: "MISSING_URL" });
 
     const p = await Product.findById(productId);
