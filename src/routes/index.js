@@ -12,6 +12,6 @@ router.use("/sync", require("./sync.routes"));
 router.use("/categories", require("./category.routes"));
 router.use("/stock-total", require("./stockTotal.routes"));
 router.use("/inbounds", require("./inbound.routes"));
-router.use("/receipt-templates", require("./receiptTemplates").router);
-
+router.use("/receipt-templates", require("./receiptTemplates"));
+router.use("/uploads", require("./upload.routes"));
 module.exports = router;

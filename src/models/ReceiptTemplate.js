@@ -1,21 +1,77 @@
 const mongoose = require("mongoose");
 
-const ReceiptTemplateSchema = new mongoose.Schema(
+const receiptTemplateSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true, trim: true },
-    paperWidth: { type: String, enum: ["80mm"], default: "80mm" },
-
-    // user editable
-    html: { type: String, required: true, default: "" },
-    css: { type: String, required: true, default: "" },
-
-    isDefault: { type: Boolean, default: false },
-    isActive: { type: Boolean, default: true },
-
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    branchId: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    description: {
+      type: String,
+      trim: true,
+    },
+    paperSize: {
+      type: Number,
+      enum: [56, 80],
+      default: 56,
+    },
+    components: [
+      {
+        id: {
+          type: String,
+          required: true,
+        },
+        type: {
+          type: String,
+          enum: [
+            "logo",
+            "heading",
+            "text",
+            "divider",
+            "customer-info",
+            "items-table",
+            "totals",
+            "qrcode",
+            "barcode",
+          ],
+          required: true,
+        },
+        content: String,
+        style: {
+          fontSize: Number,
+          fontWeight: String,
+          textAlign: String,
+          color: String,
+          marginTop: Number,
+          marginBottom: Number,
+          paddingTop: Number,
+          paddingBottom: Number,
+        },
+        config: mongoose.Schema.Types.Mixed,
+      },
+    ],
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+    isDefault: {
+      type: Boolean,
+      default: false,
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
-module.exports = mongoose.model("ReceiptTemplate", ReceiptTemplateSchema);
+// Index cho query performance
+receiptTemplateSchema.index({ branchId: 1, isActive: 1 });
+receiptTemplateSchema.index({ branchId: 1, isDefault: 1 });
+
+module.exports = mongoose.model("ReceiptTemplate", receiptTemplateSchema);

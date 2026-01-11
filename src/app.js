@@ -9,7 +9,7 @@ const apiRoutes = require("./routes");
 const { env } = require("./config/env");
 const { notFound, errorHandler } = require("./middlewares/error");
 const receiptTpl = require("./routes/receiptTemplates");
-const printReceipt = require("./routes/printReceipt");
+const printReceipt = require("./routes/receiptTemplates");
 
 
 
@@ -33,6 +33,9 @@ function createApp() {
   app.use("/api", apiRoutes);
 
   app.use("/print", printReceipt);
+
+  
+  
 
   app.use(notFound);
   app.use(errorHandler);

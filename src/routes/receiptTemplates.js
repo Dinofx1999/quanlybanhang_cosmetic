@@ -1,265 +1,457 @@
 const router = require("express").Router();
-const { z } = require("zod");
-const Handlebars = require("handlebars");
-const sanitizeHtml = require("sanitize-html");
+const bwipjs = require("bwip-js");
+const QRCode = require("qrcode");
+const crypto = require("crypto");
 
+const Order = require("../models/Order");
+const Branch = require("../models/Branch");
 const ReceiptTemplate = require("../models/ReceiptTemplate");
 const { asyncHandler } = require("../utils/asyncHandler");
+const { renderReceiptHtml } = require("./receiptTemplates.engine");
+const User = require("../models/User");
 
-// nếu bạn có authRequired thì mở ra
-// const { authRequired } = require("../middlewares/authRequired");
+// ===== Helpers
+const money = (n) => Number(n || 0).toLocaleString("vi-VN");
 
-function pickUserId(req) {
-  const id = req.user?.sub || req.user?.id || req.user?._id || null;
-  return id ? String(id) : null;
-}
-
-/**
- * ✅ Chặn script/iframe + chặn toàn bộ on* handlers.
- * Note: sanitize-html đã remove attributes không nằm trong allowedAttributes,
- * nhưng để chắc chắn, ta filter thêm.
- */
-function sanitizeTemplateHtml(html) {
-  const cleaned = sanitizeHtml(String(html || ""), {
-    allowedTags: [
-      "div", "span", "b", "strong", "i", "u", "small", "br", "hr",
-      "table", "thead", "tbody", "tr", "td", "th",
-      "img", "svg", "path",
-      "h1", "h2", "h3", "h4", "h5", "h6",
-      "p"
-    ],
-    allowedAttributes: {
-      "*": ["class", "style"],
-      img: ["src", "alt", "width", "height"],
-      svg: ["xmlns", "width", "height", "viewBox"],
-      path: ["d", "fill"]
-    },
-    allowedSchemes: ["data", "http", "https"],
-    disallowedTagsMode: "discard",
-    allowVulnerableTags: false,
+async function makeBarcodePngDataUrl(text) {
+  const png = await bwipjs.toBuffer({
+    bcid: "code128",
+    text: String(text || ""),
+    scale: 2,
+    height: 10,
+    includetext: false,
+    textxalign: "center",
   });
-
-  // ✅ hard strip any on* attributes if slipped
-  return cleaned.replace(/\son\w+\s*=\s*(['"]).*?\1/gi, "");
+  return `data:image/png;base64,${png.toString("base64")}`;
 }
 
-/**
- * ✅ CSS: bạn có thể giữ nguyên, nhưng nên tránh user đưa @import hoặc url(javascript:...)
- * Minimal filter:
- */
-function sanitizeTemplateCss(css) {
-  const s = String(css || "");
-  // chặn @import
-  const noImport = s.replace(/@import\s+[^;]+;/gi, "");
-  // chặn url(javascript:...)
-  const noJsUrl = noImport.replace(/url\(\s*['"]?\s*javascript:[^)]+\)/gi, "url()");
-  return noJsUrl;
+async function makeQrDataUrl(payload) {
+  try {
+    return await QRCode.toDataURL(String(payload || ""), { margin: 1, width: 180 });
+  } catch (e) {
+    return "";
+  }
 }
 
-// payload mẫu để preview (FE gọi cũng được)
-function buildSampleData() {
+function buildTransferText({ amount, note }) {
+  const bank = process.env.BANK_CODE || "VCB";
+  const acc = process.env.BANK_ACCOUNT || "0000000000";
+  const name = process.env.BANK_NAME || "NGUYEN PHI VU";
+  return `BANK:${bank} | ACC:${acc} | NAME:${name} | AMOUNT:${amount} | NOTE:${note}`;
+}
+
+async function getStoreByBranch(branchId) {
+  if (!branchId) {
+    return {
+      name: process.env.STORE_NAME || "STORE",
+      brandName: process.env.STORE_BRAND_NAME || "",
+      address: process.env.STORE_ADDRESS || "",
+      phone: process.env.STORE_PHONE || "",
+      logoUrl: process.env.STORE_LOGO_URL || "",
+      taxCode: process.env.STORE_TAX_CODE || "",
+    };
+  }
+
+  const br = await Branch.findById(branchId).lean();
+
   return {
-    store: {
-      name: "Bảo Ân Cosmetics",
-      address: "Tam Kỳ, Quảng Nam",
-      phone: "0909 123 456",
-      logoUrl: "",
-    },
-    order: {
-      _id: "695d03fbb3424862896c2979",
-      orderNumber: "HD-000123",
-      createdAt: new Date().toLocaleString("vi-VN"),
-      barcodeText: "HD-000123",
-    },
-    cashier: { name: "Nguyễn Phi Vũ" },
-    items: [
-      { name: "Son Hông Hồng", qty: 2, price: 120000, total: 240000 },
-      { name: "Sữa rửa mặt", qty: 1, price: 89000, total: 89000 },
-    ],
-    summary: {
-      subtotal: 329000,
-      discount: 0,
-      extraFee: 0,
-      total: 329000,
-    },
-    qr: {
-      dataUrl: "",
-      text: "CK: 0909123456 - HD-000123",
-    },
+    name: br?.name || process.env.STORE_NAME || "STORE",
+    brandName: br?.brandName || process.env.STORE_BRAND_NAME || "",
+    address: br?.address || process.env.STORE_ADDRESS || "",
+    phone: br?.phone || process.env.STORE_PHONE || "",
+    // ✅ FIX: schema Branch là "logo"
+    logoUrl: br?.logo || process.env.STORE_LOGO_URL || "",
+    taxCode: br?.taxCode || process.env.STORE_TAX_CODE || "",
   };
 }
 
-/**
- * ✅ Render HTML: tách rõ paperWidth + autoPrint + autoClose
- */
-function renderReceiptHtml({ html, css, data, autoPrint = false }) {
-  const cleanHtml = sanitizeTemplateHtml(html);
-  const cleanCss = sanitizeTemplateCss(css);
+async function getCashierName(order) {
+  // ✅ ưu tiên CONFIRMED trước (thu ngân xác nhận)
+  const uid =
+    order?.confirmedBy ||
+    order?.createdById ||
+    order?.createdBy ||
+    order?.CreatedBy;
 
-  const tpl = Handlebars.compile(cleanHtml, { noEscape: true });
-  const body = tpl(data);
-
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Receipt</title>
-  <style>
-    @page { size: 80mm auto; margin: 4mm; }
-    html, body { width: 80mm; margin: 0; padding: 0; }
-    body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #111; }
-    img { max-width: 100%; }
-    ${cleanCss || ""}
-  </style>
-</head>
-<body>
-  ${body}
-
-  <script>
-  (function(){
-    const AUTO = true; // render server
-    if (!AUTO) return;
-
-    function doPrint(){
-      try { window.focus(); } catch(e){}
-      try { window.print(); } catch(e){}
-      setTimeout(() => { try { window.close(); } catch(e){} }, 800);
-    }
-
-    // ✅ Chrome: gọi ngay khi DOM ready + fallback load
-    if (document.readyState === "complete") {
-      setTimeout(doPrint, 50);
-    } else {
-      window.addEventListener("load", () => setTimeout(doPrint, 50));
-    }
-  })();
-</script>
-
-</body>
-</html>`;
+  if (!uid) return "";
+  const u = await User.findById(uid).lean();
+  return u?.name || u?.username || "";
 }
 
 
-// ===============================
-// GET list
-// ===============================
-// router.get("/receipt-templates", authRequired, asyncHandler(async (req,res) => {
-router.get("/receipt-templates", asyncHandler(async (req, res) => {
-  const items = await ReceiptTemplate.find({ isActive: true })
-    .sort({ isDefault: -1, updatedAt: -1 })
-    .lean();
-  res.json({ ok: true, items });
-}));
+// ==========================
+// Render BLOCK template -> HTML (56/80mm)
+// ==========================
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
 
-// GET one
-router.get("/receipt-templates/:id", asyncHandler(async (req, res) => {
-  const t = await ReceiptTemplate.findById(req.params.id).lean();
-  if (!t) return res.status(404).json({ ok: false, message: "Template không tồn tại" });
-  res.json({ ok: true, template: t });
-}));
+function escapeHtmlWithNewline(s) {
+  return escapeHtml(s).replace(/\n/g, "<br/>");
+}
 
-// GET default
-router.get("/receipt-templates-default", asyncHandler(async (req, res) => {
-  const t = await ReceiptTemplate.findOne({ isActive: true, isDefault: true }).lean();
-  res.json({ ok: true, template: t || null });
-}));
 
-// CREATE
-router.post("/receipt-templates", asyncHandler(async (req, res) => {
-  const body = z.object({
-    name: z.string().min(1),
-    paperWidth: z.enum(["80mm", "58mm"]).optional(),
-    html: z.string().min(1),
-    css: z.string().optional(),
-    isDefault: z.boolean().optional(),
-  }).safeParse(req.body);
+function toNumberLike(n) {
+  const x = Number(n || 0);
+  return Number.isFinite(x) ? x : 0;
+}
 
-  if (!body.success) return res.status(400).json({ ok: false, error: body.error.flatten() });
+// Items from data.items are strings (money formatted) in your current code.
+// For block renderer, we output in a simple table style, still OK as string.
+function renderBlocksReceipt({ blocks, data, paper = 56 }) {
+  const w = paper === 80 ? 302 : 210;
 
-  const uid = pickUserId(req);
+  const line = `<div style="border-top:1px dashed #999;margin:6px 0;"></div>`;
 
-  const doc = await ReceiptTemplate.create({
-    name: body.data.name,
-    paperWidth: body.data.paperWidth || "80mm",
-    html: body.data.html,
-    css: body.data.css || "",
-    isDefault: !!body.data.isDefault,
-    createdBy: uid,
-    updatedBy: uid,
-  });
+  const styleOf = (b) => {
+    const fs = b.fontSize || 11;
+    const fw = b.bold ? 700 : 400;
+    const ta = b.align || "left";
+    return `style="font-size:${fs}px;font-weight:${fw};text-align:${ta};line-height:1.25;margin:2px 0;"`;
+  };
 
-  if (doc.isDefault) {
-    await ReceiptTemplate.updateMany({ _id: { $ne: doc._id } }, { $set: { isDefault: false } });
-  }
+  const itemsHtml = (data?.items || [])
+    .map((it) => {
+      const name = escapeHtml(it?.name || "");
+      const qty = escapeHtml(it?.qty);
+      const price = escapeHtml(it?.price);
+      const total = escapeHtml(it?.total);
+      return `
+        <div style="display:flex;gap:6px;">
+          <div style="flex:1;min-width:0;">
+            ${name}
+            <div style="color:#666;font-size:10px;">${qty} x ${price}</div>
+          </div>
+          <div style="text-align:right;white-space:nowrap;">${total}</div>
+        </div>
+      `;
+    })
+    .join("");
 
-  res.json({ ok: true, template: doc });
-}));
+  const metaHtml = `
+    <div style="text-align:left;">
+      <div>Mã: <b>${escapeHtml(data?.order?.orderNumber || "")}</b></div>
+      <div>Giờ: ${escapeHtml(data?.order?.createdAt || "")}</div>
+      ${
+        data?.cashier?.name
+          ? `<div>Thu ngân: ${escapeHtml(data.cashier.name)}</div>`
+          : ""
+      }
+    </div>
+  `;
 
-// UPDATE
-router.put("/receipt-templates/:id", asyncHandler(async (req, res) => {
-  const body = z.object({
-    name: z.string().min(1).optional(),
-    html: z.string().min(1).optional(),
-    css: z.string().optional(),
-    paperWidth: z.enum(["80mm", "58mm"]).optional(),
-    isActive: z.boolean().optional(),
-  }).safeParse(req.body);
+  const totalsHtml = `
+    <div style="text-align:left;">
+      <div style="display:flex;justify-content:space-between;">
+        <span>Tạm tính</span><b>${escapeHtml(data?.summary?.subtotal || "")}</b>
+      </div>
+      ${
+        (data?.summary?.discount && data.summary.discount !== "0") ||
+        (data?.summary?.discount && data.summary.discount !== "0")
+          ? `<div style="display:flex;justify-content:space-between;"><span>Giảm giá</span><span>- ${escapeHtml(
+              data.summary.discount
+            )}</span></div>`
+          : ""
+      }
+      ${
+        data?.summary?.extraFee && data.summary.extraFee !== "0"
+          ? `<div style="display:flex;justify-content:space-between;"><span>Phụ thu</span><span>+ ${escapeHtml(
+              data.summary.extraFee
+            )}</span></div>`
+          : ""
+      }
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:4px;">
+        <span>Tổng</span><b>${escapeHtml(data?.summary?.total || "")}</b>
+      </div>
+    </div>
+  `;
 
-  if (!body.success) return res.status(400).json({ ok: false, error: body.error.flatten() });
+  const paymentHtml = `
+    <div style="text-align:left;">
+      ${
+        data?.qr?.dataUrl
+          ? `<div style="margin-top:6px;text-align:center;">
+              <img src="${escapeHtml(data.qr.dataUrl)}" style="max-width:180px;"/>
+              <div style="font-size:10px;color:#555;margin-top:2px;">QR chuyển khoản</div>
+            </div>`
+          : ""
+      }
+    </div>
+  `;
 
-  const uid = pickUserId(req);
+  const barcodeHtml = data?.order?.barcodeDataUrl
+    ? `<div style="text-align:center;margin-top:6px;">
+        <img src="${escapeHtml(data.order.barcodeDataUrl)}" style="max-width:100%;height:40px;object-fit:contain;" />
+      </div>`
+    : "";
 
-  const t = await ReceiptTemplate.findById(req.params.id);
-  if (!t) return res.status(404).json({ ok: false, message: "Template không tồn tại" });
+  const blockHtml = (b) => {
+    if (!b || b.enabled === false) return "";
 
-  if (body.data.name !== undefined) t.name = body.data.name;
-  if (body.data.html !== undefined) t.html = body.data.html;
-  if (body.data.css !== undefined) t.css = body.data.css;
-  if (body.data.paperWidth !== undefined) t.paperWidth = body.data.paperWidth;
-  if (body.data.isActive !== undefined) t.isActive = body.data.isActive;
+    switch (b.type) {
+      case "LOGO":
+        return data?.store?.logoUrl
+          ? `<div ${styleOf(b)}><img src="${escapeHtml(
+              data.store.logoUrl
+            )}" style="max-height:52px;max-width:100%;object-fit:contain;" /></div>`
+          : "";
 
-  t.updatedBy = uid;
-  await t.save();
+      case "BRAND_NAME":
+        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.brandName || data?.store?.name || "")}</div>`;
 
-  res.json({ ok: true, template: t });
-}));
+      case "SHOP_NAME":
+        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.name || "")}</div>`;
 
-// SET DEFAULT
-router.post("/receipt-templates/:id/set-default", asyncHandler(async (req, res) => {
-  const t = await ReceiptTemplate.findById(req.params.id);
-  if (!t) return res.status(404).json({ ok: false, message: "Template không tồn tại" });
+      case "ADDRESS":
+        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.address || "")}</div>`;
 
-  await ReceiptTemplate.updateMany({}, { $set: { isDefault: false } });
-  t.isDefault = true;
-  await t.save();
+      case "PHONE":
+        return `<div ${styleOf(b)}>ĐT: ${escapeHtml(data?.store?.phone || "")}</div>`;
 
-  res.json({ ok: true });
-}));
+      case "TAX_CODE":
+        return data?.store?.taxCode
+          ? `<div ${styleOf(b)}>MST: ${escapeHtml(data.store.taxCode)}</div>`
+          : "";
 
-// PREVIEW (FE đưa html/css lên để preview nhanh) ✅ KHÔNG auto print
-router.post("/receipt-templates/preview", asyncHandler(async (req, res) => {
-  const body = z.object({
-    html: z.string().min(1),
-    css: z.string().optional(),
-    data: z.any().optional(),
-    paper: z.enum(["80mm", "58mm"]).optional(),
-  }).safeParse(req.body);
+      case "ORDER_META":
+        return `<div ${styleOf(b)}>${metaHtml}</div>`;
 
-  if (!body.success) return res.status(400).json({ ok: false, error: body.error.flatten() });
+      case "ITEMS_TABLE":
+        return `${line}<div ${styleOf(b)}>${itemsHtml}</div>${line}${barcodeHtml}`;
 
-  const data = body.data.data || buildSampleData();
-  const out = renderReceiptHtml({
-    html: body.data.html,
-    css: body.data.css || "",
-    data,
-    paper: body.data.paper || "80mm",
-    autoPrint: false,
-    autoClose: false,
-  });
+      case "TOTALS":
+        return `<div ${styleOf(b)}>${totalsHtml}</div>`;
 
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  return res.send(out);
-}));
+      case "PAYMENT":
+        return `<div ${styleOf(b)}>${paymentHtml}</div>`;
 
-module.exports = { router, renderReceiptHtml, buildSampleData };
+      case "FOOTER_TEXT":
+      return `<div ${styleOf(b)}>${escapeHtmlWithNewline(b.text || "Cảm ơn quý khách!")}</div>`;
+
+      default:
+        return "";
+    }
+  };
+
+  const body = (blocks || []).map(blockHtml).filter(Boolean).join("");
+
+  // CSS base for 56/80mm printing
+  const css = `
+    @page { size: ${paper}mm auto; margin: 6mm; }
+    html, body { padding:0; margin:0; }
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; color:#111; }
+    img { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  `;
+
+  return `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Receipt</title>
+        <style>${css}</style>
+      </head>
+      <body>
+        <div style="width:${w}px; margin:0 auto; padding:6px;">
+          ${body}
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/**
+ * GET /print/receipt/:orderId
+ * Query params:
+ * - templateId (optional): ID của template (html/css)
+ * - autoPrint hoặc autoprint: "1" hoặc "true" để tự động in
+ * - paper: "80" cho khổ 80mm (optional) (ưu tiên branch.receipt.paperSize)
+ */
+router.get(
+  "/receipt/:orderId",
+  asyncHandler(async (req, res) => {
+    const { orderId } = req.params;
+
+    const templateId = req.query.templateId ? String(req.query.templateId) : "";
+    const autoPrintParam = req.query.autoPrint || req.query.autoprint;
+    const autoPrint = autoPrintParam === "1" || autoPrintParam === "true";
+
+    console.log(`🖨️ [Print Receipt] OrderID: ${orderId} | Auto print: ${autoPrint}`);
+
+    const nonce = crypto.randomBytes(16).toString("base64");
+
+    const order = await Order.findById(orderId).lean();
+    if (!order) {
+      console.error(`❌ Order not found: ${orderId}`);
+      return res.status(404).send("Order not found");
+    }
+
+    // Load branch to detect block-template + paperSize
+    const br = order.branchId || order.branch ? await Branch.findById(order.branchId || order.branch).lean() : null;
+
+    // paper priority: branch.receipt.paperSize > query.paper > default 56
+    const paperFromBranch = Number(br?.receipt?.paperSize || 0);
+    const paperFromQuery = String(req.query.paper || "") === "80" ? 80 : 0;
+    const paper = paperFromBranch === 80 ? 80 : paperFromQuery === 80 ? 80 : 56;
+
+    // ✅ If branch has blocks template -> use it
+    const blocks = Array.isArray(br?.receipt?.template) && br.receipt.template.length ? br.receipt.template : null;
+
+    // fallback html/css template flow (old)
+    let tpl = null;
+    if (!blocks) {
+      if (templateId) {
+        tpl = await ReceiptTemplate.findById(templateId).lean();
+        console.log(`📄 Using template ID: ${templateId}`);
+      }
+      if (!tpl) {
+        tpl = await ReceiptTemplate.findOne({ isActive: true, isDefault: true }).lean();
+        console.log(`📄 Using default template`);
+      }
+      if (!tpl) {
+        console.error(`❌ No receipt template found`);
+        return res.status(500).send("No receipt template. Create a template first.");
+      }
+    } else {
+      console.log(`🧩 Using Branch receipt.template blocks (${blocks.length})`);
+    }
+
+    const store = await getStoreByBranch(order.branchId || order.branch || null);
+
+    const createdAt = order.createdAt ? new Date(order.createdAt).toLocaleString("vi-VN") : "";
+    const orderNumber = order.orderNumber || order.code || String(order._id).slice(-6);
+
+    const itemsRaw = Array.isArray(order.items) ? order.items : [];
+    const items = itemsRaw.map((it) => {
+      const name = it.name || it.productName || "Sản phẩm";
+      const qty = Number(it.qty ?? it.quantity ?? 0);
+      const price = Number(it.price ?? 0);
+      const total = Number(it.total ?? qty * price);
+      return {
+        name,
+        qty,
+        price: money(price),
+        total: money(total),
+      };
+    });
+
+    const subtotal =
+      Number(order.subtotal ?? order.subTotal ?? 0) ||
+      itemsRaw.reduce((s, it) => {
+        const qty = Number(it.qty ?? it.quantity ?? 0);
+        const price = Number(it.price ?? 0);
+        return s + qty * price;
+      }, 0);
+
+    const discount = Number(order.discount ?? 0);
+    const extraFee = Number(order.extraFee ?? 0);
+    const total = Math.max(0, subtotal - discount + extraFee);
+
+    const cashierName = await getCashierName(order);
+    const barcodeText = String(orderNumber || order._id);
+    const barcodeDataUrl = await makeBarcodePngDataUrl(barcodeText);
+
+    const transferText = buildTransferText({
+      amount: total,
+      note: `TT ${orderNumber}`,
+    });
+    const qrDataUrl = await makeQrDataUrl(transferText);
+
+    const data = {
+      store: {
+        name: store.name,
+        brandName: store.brandName,
+        address: store.address,
+        phone: store.phone,
+        logoUrl: store.logoUrl,
+        taxCode: store.taxCode,
+      },
+      order: {
+        _id: String(order._id),
+        orderNumber,
+        createdAt,
+        barcodeText,
+        barcodeDataUrl,
+      },
+      cashier: { name: cashierName },
+      items: items.map((x) => ({
+        name: x.name,
+        qty: x.qty,
+        price: x.price,
+        total: x.total,
+      })),
+      summary: {
+        subtotal: money(subtotal),
+        discount: money(discount),
+        extraFee: money(extraFee),
+        total: money(total),
+      },
+      qr: {
+        text: transferText,
+        dataUrl: qrDataUrl,
+      },
+    };
+
+    let html = "";
+
+    // ✅ NEW: blocks template
+    if (blocks) {
+      html = renderBlocksReceipt({ blocks, data, paper });
+    } else {
+      // OLD: html/css template
+      html = renderReceiptHtml({ html: tpl.html, css: tpl.css, data });
+    }
+
+    // ✅ Inject auto print script with nonce
+    if (autoPrint) {
+      console.log(`🖨️ Injecting auto print script with nonce`);
+
+      const autoScript = `
+      <script nonce="${nonce}">
+        console.log('🖨️ Auto print script loaded');
+        function triggerPrint() {
+          try {
+            console.log('🖨️ Triggering window.print()...');
+            window.print();
+            console.log('✅ Print dialog opened');
+          } catch (e) {
+            console.error('❌ Print error:', e);
+            alert('Không thể tự động in. Vui lòng bấm Ctrl+P để in.');
+          }
+        }
+        if (document.readyState === 'complete') {
+          setTimeout(triggerPrint, 800);
+        } else {
+          window.addEventListener('load', function() {
+            setTimeout(triggerPrint, 800);
+          });
+        }
+      </script>
+      `;
+
+      if (html.includes("</body>")) {
+        html = html.replace("</body>", `${autoScript}</body>`);
+      } else {
+        html += autoScript;
+      }
+    }
+
+    // ✅ CSP allow nonce script + inline css + images
+    res.setHeader(
+      "Content-Security-Policy",
+      `script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:;`
+    );
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(html);
+
+    console.log(`✅ [Print Receipt] Sent HTML for order ${orderNumber}`);
+  })
+);
+
+module.exports = router;

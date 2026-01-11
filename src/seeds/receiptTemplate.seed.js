@@ -69,7 +69,7 @@ const DEFAULT_HTML = `
 </div>
 
 <div class="center muted" style="font-size:11px;margin-top:6px">
-  Cảm ơn quý khách ❤️
+  Cảm ơn quý khách ❤️ dino
 </div>
 `;
 
