@@ -12,8 +12,8 @@ const CustomerPointsLedgerSchema = new mongoose.Schema(
     // +points hoặc -points
     delta: { type: Number, required: true },
 
-    // số dư sau khi apply (audit nhanh)
-    balanceAfter: { type: Number, required: true },
+    // ✅ required nhưng có default để tránh fail khi tạo trước
+    balanceAfter: { type: Number, required: true, default: 0 },
 
     // EARN_ORDER | REVERT_EARN_CANCELLED | REVERT_EARN_REFUNDED | MANUAL_ADJUST ...
     reason: { type: String, default: "", index: true },
@@ -25,14 +25,14 @@ const CustomerPointsLedgerSchema = new mongoose.Schema(
     branchId: { type: mongoose.Schema.Types.ObjectId, ref: "Branch", index: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
 
-    // nếu sau này muốn điểm hết hạn
     expireAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
 );
 
 CustomerPointsLedgerSchema.index({ customerId: 1, createdAt: -1 });
-// chống ghi trùng cho 1 event (idempotent)
+
+// ✅ idempotent
 CustomerPointsLedgerSchema.index({ refType: 1, refId: 1, reason: 1 }, { unique: true });
 
 module.exports = mongoose.model("CustomerPointsLedger", CustomerPointsLedgerSchema);
