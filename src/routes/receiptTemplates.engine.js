@@ -16,6 +16,9 @@ function renderReceiptHtml({ html = "", css = "", data = {} }) {
     return v === undefined || v === null ? "" : String(v);
   });
 
+  const template = Handlebars.compile(html || "");
+    const renderedBody = template(data);
+
   return `
   <!doctype html>
   <html>

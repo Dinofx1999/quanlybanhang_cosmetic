@@ -6,10 +6,8 @@ const crypto = require("crypto");
 
 const Order = require("../models/Order");
 const Branch = require("../models/Branch");
-const ReceiptTemplate = require("../models/ReceiptTemplate");
-const Customer = require("../models/Customer"); // ✅ thêm để lấy điểm còn lại
+const Customer = require("../models/Customer");
 const { asyncHandler } = require("../utils/asyncHandler");
-const { renderReceiptHtml } = require("./receiptTemplates.engine");
 const User = require("../models/User");
 
 // ===== Helpers
@@ -89,7 +87,6 @@ function getPaymentMethodLabel(method) {
   return m || "Khác";
 }
 
-// ✅ NEW: lấy điểm tích luỹ còn lại (ưu tiên customerId, fallback theo phone)
 async function getCustomerPointsBalance(order) {
   const cid =
     order?.customerId ||
@@ -117,6 +114,24 @@ async function getCustomerPointsBalance(order) {
   return { points: 0, customer: null };
 }
 
+// ✅ Default blocks template
+const DEFAULT_BLOCKS = [
+  { id: "1", type: "LOGO", enabled: true, align: "center" },
+  { id: "2", type: "BRAND_NAME", enabled: true, align: "center", bold: true, fontSize: 14 },
+  { id: "3", type: "SHOP_NAME", enabled: true, align: "center", fontSize: 12 },
+  { id: "4", type: "ADDRESS", enabled: true, align: "center", fontSize: 11 },
+  { id: "5", type: "PHONE", enabled: true, align: "center", fontSize: 11 },
+  { id: "6", type: "ORDER_META", enabled: true, align: "left", fontSize: 11 },
+  { id: "7", type: "CUSTOMER_INFO", enabled: true, align: "left", fontSize: 11 },
+  { id: "8", type: "LOYALTY_INFO", enabled: true, align: "left", fontSize: 11 },
+  { id: "9", type: "ITEMS_TABLE", enabled: true, align: "left", fontSize: 11 },
+  { id: "10", type: "TOTALS", enabled: true, align: "left", bold: true, fontSize: 12 },
+  { id: "11", type: "PAYMENTS_INFO", enabled: true, align: "left", fontSize: 11 },
+  { id: "12", type: "BARCODE", enabled: true, align: "center" },
+  { id: "13", type: "QR_PAYMENT", enabled: true, align: "center" },
+  { id: "14", type: "FOOTER_TEXT", enabled: true, align: "center", fontSize: 11, text: "Cảm ơn quý khách!" },
+];
+
 // ==========================
 // Render BLOCK template -> HTML (56/80mm)
 // ==========================
@@ -137,20 +152,21 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
 
   const line = `<div style="border-top:1px dashed #999;margin:6px 0;"></div>`;
 
-  const styleOf = (b) => {
+  const styleOf = (b, isShopInfo = false) => {
     const fs = b.fontSize || 11;
     const fw = b.bold ? 700 : 400;
     const ta = b.align || "left";
-    return `style="font-size:${fs}px;font-weight:${fw};text-align:${ta};line-height:1.25;margin:2px 0;"`;
+    const mb = isShopInfo ? "5px" : "2px";
+    return `style="font-size:${fs}px;font-weight:${fw};text-align:${ta};line-height:1.25;margin-bottom:${mb};"`;
   };
 
-  //Format items table
   const item_format = (item) => {
-    if(item === "CONFIRM") return "Hoàn Tất";
-    if(item === "CANCEL") return "Hủy Đơn";
-    if(item === "DEBT ") return "Đơn Nợ";
-    if(item === "PENDING") return "Đơn Tạm";
-  }
+    if (item === "CONFIRM") return "Hoàn Tất";
+    if (item === "CANCEL") return "Hủy Đơn";
+    if (item === "DEBT") return "Đơn Nợ";
+    if (item === "PENDING") return "Đơn Tạm";
+    return item;
+  };
 
   // ✅ Items table
   const itemsHtml = (data?.items || [])
@@ -190,13 +206,13 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
   `;
 
   // ✅ Customer info
-  const customerHtml = data?.customer
+  const customerHtml = data?.customer?.name || data?.customer?.phone
     ? `
       <div style="text-align:left;font-size:11px;">
         <div style="font-weight:600;margin-bottom:3px;">THÔNG TIN KHÁCH HÀNG</div>
         ${
-          data.customer
-            ? `<div>Tên: <b>${escapeHtml(data.customer.name) || "Khách Lẻ"}</b></div>`
+          data.customer.name
+            ? `<div>Tên: <b>${escapeHtml(data.customer.name)}</b></div>`
             : ""
         }
         ${
@@ -213,16 +229,16 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
     `
     : "";
 
-  // ✅ Loyalty info (NEW: thêm pointsBalance)
+  // ✅ Loyalty info
   const loyaltyHtml =
-    data?.loyalty?.pointsEarned && data?.customer?.name ||
-    data?.loyalty?.pointsRedeemed && data?.customer?.name ||
-    data?.loyalty?.pointsBalance != null && data?.customer?.name 
+    (data?.loyalty?.pointsEarned && data?.customer?.name) ||
+    (data?.loyalty?.pointsRedeemed && data?.customer?.name) ||
+    (data?.loyalty?.pointsBalance != null && data?.customer?.name)
       ? `
       <div style="text-align:left;font-size:11px;">
         <div style="font-weight:600;margin-bottom:3px;">TÍCH ĐIỂM & ƯU ĐÃI</div>
         ${
-          data.loyalty.pointsRedeemed && data.loyalty.pointsRedeemed > 0 
+          data.loyalty.pointsRedeemed && data.loyalty.pointsRedeemed > 0
             ? `<div>Đã dùng: <b>-${money(data.loyalty.pointsRedeemed)} điểm</b> (Giảm ${money(data.loyalty.redeemAmount)}đ)</div>`
             : ""
         }
@@ -279,8 +295,9 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
   `;
 
   // ✅ Payments info
-  const paymentsHtml = data?.payments && data.payments.length > 0
-    ? `
+  const paymentsHtml =
+    data?.payments && data.payments.length > 0
+      ? `
       <div style="text-align:left;font-size:11px;">
         <div style="font-weight:600;margin-bottom:3px;">THANH TOÁN</div>
         ${data.payments
@@ -296,7 +313,8 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
           <span>Đã trả</span><span style="color:#388e3c;">${escapeHtml(data.summary.paid || "0")}</span>
         </div>
         ${
-          data?.summary?.due && Number(String(data.summary.due).replace(/\D/g, "")) > 0
+          data?.summary?.due &&
+          Number(String(data.summary.due).replace(/\D/g, "")) > 0
             ? `<div style="display:flex;justify-content:space-between;font-weight:600;margin-top:2px;">
                 <span>Còn thiếu</span><span style="color:#d32f2f;">${escapeHtml(data.summary.due)}</span>
               </div>`
@@ -304,7 +322,7 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
         }
       </div>
     `
-    : "";
+      : "";
 
   // ✅ QR payment
   const qrHtml = data?.qr?.dataUrl
@@ -328,36 +346,57 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
   const blockHtml = (b) => {
     if (!b || b.enabled === false) return "";
 
+    const isShopInfo = [
+      "LOGO",
+      "BRAND_NAME",
+      "SHOP_NAME",
+      "ADDRESS",
+      "PHONE",
+      "TAX_CODE",
+    ].includes(b.type);
+
     switch (b.type) {
       case "LOGO":
         return data?.store?.logoUrl
-          ? `<div ${styleOf(b)}><img src="${escapeHtml(
+          ? `<div ${styleOf(b, true)}><img src="${escapeHtml(
               data.store.logoUrl
             )}" style="max-height:52px;max-width:100%;object-fit:contain;" /></div>`
           : "";
 
       case "BRAND_NAME":
-        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.brandName || data?.store?.name || "")}</div>`;
+        return `<div ${styleOf(b, true)}>${escapeHtml(
+          data?.store?.brandName || data?.store?.name || ""
+        )}</div>`;
 
       case "SHOP_NAME":
-        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.name || "")}</div>`;
+        return `<div ${styleOf(b, true)}>${escapeHtml(
+          data?.store?.name || ""
+        )}</div>`;
 
       case "ADDRESS":
-        return `<div ${styleOf(b)}>${escapeHtml(data?.store?.address || "")}</div>`;
+        return `<div ${styleOf(b, true)}>${escapeHtml(
+          data?.store?.address || ""
+        )}</div>`;
 
       case "PHONE":
-        return `<div ${styleOf(b)}>ĐT: ${escapeHtml(data?.store?.phone || "")}</div>`;
+        return `<div ${styleOf(b, true)}>ĐT: ${escapeHtml(
+          data?.store?.phone || ""
+        )}</div>`;
 
       case "TAX_CODE":
         return data?.store?.taxCode
-          ? `<div ${styleOf(b)}>MST: ${escapeHtml(data.store.taxCode)}</div>`
+          ? `<div ${styleOf(b, true)}>MST: ${escapeHtml(
+              data.store.taxCode
+            )}</div>`
           : "";
 
       case "ORDER_META":
         return `<div ${styleOf(b)}>${metaHtml}</div>`;
 
       case "CUSTOMER_INFO":
-        return customerHtml ? `${line}<div ${styleOf(b)}>${customerHtml}</div>` : "";
+        return customerHtml
+          ? `${line}<div ${styleOf(b)}>${customerHtml}</div>`
+          : "";
 
       case "LOYALTY_INFO":
         return loyaltyHtml ? `<div ${styleOf(b)}>${loyaltyHtml}</div>` : "";
@@ -369,7 +408,9 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
         return `<div ${styleOf(b)}>${totalsHtml}</div>`;
 
       case "PAYMENTS_INFO":
-        return paymentsHtml ? `${line}<div ${styleOf(b)}>${paymentsHtml}</div>` : "";
+        return paymentsHtml
+          ? `${line}<div ${styleOf(b)}>${paymentsHtml}</div>`
+          : "";
 
       case "BARCODE":
         return barcodeHtml;
@@ -389,11 +430,37 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
 
   const body = (blocks || []).map(blockHtml).filter(Boolean).join("");
 
+  // ✅ Mobile-friendly CSS
   const css = `
     @page { size: ${paper}mm auto; margin: 6mm; }
-    html, body { padding:0; margin:0; }
-    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; color:#111; }
-    img { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    html, body { 
+      padding: 0; 
+      margin: 0; 
+      -webkit-text-size-adjust: 100%;
+    }
+    body { 
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; 
+      color: #111;
+      background: #fff;
+    }
+    img { 
+      -webkit-print-color-adjust: exact; 
+      print-color-adjust: exact;
+      max-width: 100%;
+      height: auto;
+    }
+    
+    @media screen and (max-width: 480px) {
+      body {
+        font-size: 14px;
+      }
+    }
+    
+    @media screen {
+      * {
+        -webkit-tap-highlight-color: transparent;
+      }
+    }
   `;
 
   return `
@@ -401,12 +468,14 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
     <html>
       <head>
         <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
         <title>Receipt</title>
         <style>${css}</style>
       </head>
       <body>
-        <div style="width:${w}px; margin:0 auto; padding:6px;">
+        <div style="width:100%;max-width:${w}px;margin:0 auto;padding:6px;box-sizing:border-box;">
           ${body}
         </div>
       </body>
@@ -417,7 +486,6 @@ function renderBlocksReceipt({ blocks, data, paper = 56 }) {
 /**
  * GET /print/receipt/:orderId
  * Query params:
- * - templateId (optional): ID của template (html/css)
  * - autoPrint hoặc autoprint: "1" hoặc "true" để tự động in
  * - paper: "80" cho khổ 80mm (optional) (ưu tiên branch.receipt.paperSize)
  */
@@ -426,11 +494,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const { orderId } = req.params;
 
-    const templateId = req.query.templateId ? String(req.query.templateId) : "";
     const autoPrintParam = req.query.autoPrint || req.query.autoprint;
     const autoPrint = autoPrintParam === "1" || autoPrintParam === "true";
 
-    console.log(`🖨️ [Print Receipt] OrderID: ${orderId} | Auto print: ${autoPrint}`);
+    console.log(
+      `🖨️ [Print Receipt] OrderID: ${orderId} | Auto print: ${autoPrint}`
+    );
 
     const nonce = crypto.randomBytes(16).toString("base64");
 
@@ -449,39 +518,31 @@ router.get(
     // paper priority: branch.receipt.paperSize > query.paper > default 56
     const paperFromBranch = Number(br?.receipt?.paperSize || 0);
     const paperFromQuery = String(req.query.paper || "") === "80" ? 80 : 0;
-    const paper = paperFromBranch === 80 ? 80 : paperFromQuery === 80 ? 80 : 56;
+    const paper =
+      paperFromBranch === 80 ? 80 : paperFromQuery === 80 ? 80 : 56;
 
-    // ✅ If branch has blocks template -> use it
-    const blocks =
-      Array.isArray(br?.receipt?.template) && br.receipt.template.length
-        ? br.receipt.template
-        : null;
+    // ✅ FORCE dùng blocks template
+    let blocks = Array.isArray(br?.receipt?.template) && br.receipt.template.length
+      ? br.receipt.template
+      : null;
 
-    // fallback html/css template flow (old)
-    let tpl = null;
+    // ✅ Nếu không có template → dùng default blocks
     if (!blocks) {
-      if (templateId) {
-        tpl = await ReceiptTemplate.findById(templateId).lean();
-        console.log(`📄 Using template ID: ${templateId}`);
-      }
-      if (!tpl) {
-        tpl = await ReceiptTemplate.findOne({ isActive: true, isDefault: true }).lean();
-        console.log(`📄 Using default template`);
-      }
-      if (!tpl) {
-        console.error(`❌ No receipt template found`);
-        return res.status(500).send("No receipt template. Create a template first.");
-      }
+      console.log("⚠️ Branch không có template, dùng default blocks");
+      blocks = DEFAULT_BLOCKS;
     } else {
       console.log(`🧩 Using Branch receipt.template blocks (${blocks.length})`);
     }
 
-    const store = await getStoreByBranch(order.branchId || order.branch || null);
+    const store = await getStoreByBranch(
+      order.branchId || order.branch || null
+    );
 
     const createdAt = order.createdAt
       ? new Date(order.createdAt).toLocaleString("vi-VN")
       : "";
-    const orderNumber = order.orderNumber || order.code || String(order._id).slice(-6);
+    const orderNumber =
+      order.orderNumber || order.code || String(order._id).slice(-6);
     const orderStatus = String(order.status || "").toUpperCase();
 
     // ✅ Items
@@ -511,7 +572,10 @@ router.get(
     const discount = Number(order.discount ?? 0);
     const extraFee = Number(order.extraFee ?? 0);
     const pointsRedeemAmount = Number(order.pointsRedeemAmount ?? 0);
-    const total = Math.max(0, subtotal - discount - pointsRedeemAmount + extraFee);
+    const total = Math.max(
+      0,
+      subtotal - discount - pointsRedeemAmount + extraFee
+    );
     const pricingNote = order.pricingNote || "";
 
     // ✅ Payments
@@ -529,11 +593,14 @@ router.get(
     const pointsRedeemed = Number(order.pointsRedeemed ?? 0);
 
     // ✅ NEW: lấy điểm còn lại từ Customer
-    const { points: pointsBalance, customer: customerDoc } = await getCustomerPointsBalance(order);
+    const { points: pointsBalance, customer: customerDoc } =
+      await getCustomerPointsBalance(order);
 
     // ✅ Customer (ưu tiên order, fallback customerDoc)
-    const customerName = order.delivery?.receiverName || customerDoc?.name || "";
-    const customerPhone = order.delivery?.receiverPhone || customerDoc?.phone || "";
+    const customerName =
+      order.delivery?.receiverName || customerDoc?.name || "";
+    const customerPhone =
+      order.delivery?.receiverPhone || customerDoc?.phone || "";
     const customerAddress = order.delivery?.address || "";
 
     // ✅ Cashier
@@ -577,7 +644,7 @@ router.get(
         pointsEarned,
         pointsRedeemed,
         redeemAmount: pointsRedeemAmount,
-        pointsBalance, // ✅ hiển thị "Còn lại"
+        pointsBalance,
       },
       items: items.map((x) => ({
         name: x.name,
@@ -601,15 +668,8 @@ router.get(
       },
     };
 
-    let html = "";
-
-    // ✅ NEW: blocks template
-    if (blocks) {
-      html = renderBlocksReceipt({ blocks, data, paper });
-    } else {
-      // OLD: html/css template
-      html = renderReceiptHtml({ html: tpl.html, css: tpl.css, data });
-    }
+    // ✅ LUÔN dùng blocks template
+    let html = renderBlocksReceipt({ blocks, data, paper });
 
     // ✅ Inject auto print script with nonce
     if (autoPrint) {
