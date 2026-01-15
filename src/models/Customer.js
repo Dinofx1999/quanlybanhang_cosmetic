@@ -23,16 +23,20 @@ const CustomerSchema = new mongoose.Schema(
       lastOrderAt: { type: Date, default: null },
     },
 
-    // ✅ biến xét hạng theo bạn chốt:
-    // - cộng dồn khi mua
-    // - KHÔNG reset khi lên hạng
-    // - reset = 0 khi rớt hạng
     tierProgress: {
       spendForTier: { type: Number, default: 0 },
       resetAt: { type: Date, default: Date.now },
     },
 
     tierUpdatedAt: { type: Date, default: null },
+
+    // ✅ NEW: cấp sỉ/đại lý để lấy giá theo tier của Product
+    tierAgencyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TierAgency",
+      default: null,
+      index: true,
+    },
   },
   { timestamps: true }
 );

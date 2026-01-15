@@ -18,5 +18,6 @@ router.use("/uploads", require("./upload.routes"));
 // ✅ ADD:
 router.use("/tiers", require("./tiers.routes"));
 router.use("/loyalty-settings", require("./loyaltySettings.routes"));
+router.use("/tier-agencies", require("./tierAgency.routes"));
 
 module.exports = router;
