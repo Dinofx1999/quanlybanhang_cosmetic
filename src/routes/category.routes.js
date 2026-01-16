@@ -31,19 +31,19 @@ async function calculateCategoryMetadata(parentId) {
     throw new Error("PARENT_CATEGORY_NOT_FOUND");
   }
 
+  // ✅ FIX: Kiểm tra parent.path có phải array không
+  const parentPath = Array.isArray(parent.path) ? parent.path : [];
+  
   // Tính level, path, parentName từ parent
   return {
-    level: parent.level + 1,
-    path: [...parent.path, parentId],
+    level: (parent.level || 0) + 1,  // ✅ FIX: Fallback nếu parent.level undefined
+    path: [...parentPath, parentId],
     parentName: parent.name,
   };
 }
 
 /**
  * Build cây phân cấp từ danh sách flat
- * @param {Array} categories - Danh sách categories flat
- * @param {String|null} parentId - ID của parent cần build children
- * @returns {Array} Cây phân cấp với children nested
  */
 function buildTree(categories, parentId = null) {
   return categories
@@ -60,8 +60,6 @@ function buildTree(categories, parentId = null) {
 
 /**
  * Lấy tất cả category con (recursive - tất cả cấp)
- * @param {String} categoryId - ID của category cha
- * @returns {Array<String>} Danh sách IDs của tất cả descendants
  */
 async function getAllDescendants(categoryId) {
   const descendants = [];
@@ -83,43 +81,35 @@ async function getAllDescendants(categoryId) {
 }
 
 /**
- * Kiểm tra circular reference (vòng lặp cha-con)
- * VD: A không thể là con của chính A, hoặc con của con của A
- * @param {String} categoryId - ID của category đang xét
- * @param {String} newParentId - ID của parent mới muốn set
- * @returns {Boolean} true nếu có circular reference
+ * Kiểm tra circular reference
  */
 async function checkCircularReference(categoryId, newParentId) {
   if (!newParentId) return false;
   
-  // Nếu parent mới chính là category hiện tại => circular
   if (String(categoryId) === String(newParentId)) return true;
 
-  // Lấy tất cả descendants của category hiện tại
   const descendants = await getAllDescendants(categoryId);
   
-  // Nếu parent mới nằm trong descendants => circular
   return descendants.some((id) => String(id) === String(newParentId));
 }
 
 /**
  * Update path và level cho tất cả children khi parent thay đổi
- * @param {String} categoryId - ID của category vừa thay đổi
  */
 async function updateChildrenPaths(categoryId) {
   const category = await Category.findById(categoryId);
   if (!category) return;
 
-  // Tìm tất cả children trực tiếp
   const children = await Category.find({ parentId: categoryId });
 
   for (const child of children) {
-    // Update path và level của child
-    child.path = [...category.path, categoryId];
-    child.level = category.level + 1;
+    // ✅ FIX: Kiểm tra category.path
+    const categoryPath = Array.isArray(category.path) ? category.path : [];
+    
+    child.path = [...categoryPath, categoryId];
+    child.level = (category.level || 0) + 1;  // ✅ FIX: Fallback
     await child.save();
 
-    // Recursive update cho children của children
     await updateChildrenPaths(child._id);
   }
 }
@@ -130,22 +120,6 @@ async function updateChildrenPaths(categoryId) {
 
 /**
  * GET /api/categories
- * Lấy danh sách categories với các tùy chọn filter
- * 
- * Query params:
- *   - parentId: 'root' | 'null' | ObjectId
- *     + 'root' hoặc 'null': chỉ lấy root categories (không có parent)
- *     + ObjectId: lấy children của category này
- *   - includeChildren: 'true' | 'false'
- *     + 'true': bao gồm luôn tất cả descendants
- *   - format: 'flat' | 'tree'
- *     + 'flat': trả về array thông thường
- *     + 'tree': trả về cấu trúc cây với children nested
- * 
- * Response:
- *   { ok: true, items: [...], total: number }
- *   hoặc
- *   { ok: true, tree: [...], total: number }
  */
 router.get(
   "/",
@@ -155,21 +129,16 @@ router.get(
 
     let query = { isActive: true };
 
-    // Filter theo parentId
     if (parentId === "root" || parentId === "null") {
-      // Chỉ lấy root categories
       query.parentId = null;
     } else if (parentId && mongoose.isValidObjectId(parentId)) {
-      // Lấy children của category cụ thể
       query.parentId = parentId;
     }
 
-    // Query categories theo filter
     let categories = await Category.find(query)
       .sort({ order: 1, name: 1 })
       .lean();
 
-    // Nếu includeChildren = true, lấy luôn tất cả descendants
     if (includeChildren === "true" && parentId && mongoose.isValidObjectId(parentId)) {
       const descendants = await getAllDescendants(parentId);
       const childCategories = await Category.find({
@@ -182,7 +151,6 @@ router.get(
       categories = [...categories, ...childCategories];
     }
 
-    // Nếu format = tree, build cây phân cấp
     if (format === "tree") {
       const tree = buildTree(
         categories,
@@ -191,27 +159,12 @@ router.get(
       return res.json({ ok: true, tree, total: categories.length });
     }
 
-    // Mặc định trả về flat list
     res.json({ ok: true, items: categories, total: categories.length });
   })
 );
 
 /**
  * GET /api/categories/tree
- * Lấy toàn bộ cây danh mục (tất cả categories dạng tree)
- * 
- * Response:
- *   {
- *     ok: true,
- *     tree: [
- *       {
- *         _id: "...",
- *         name: "...",
- *         children: [...]
- *       }
- *     ],
- *     total: number
- *   }
  */
 router.get(
   "/tree",
@@ -229,17 +182,6 @@ router.get(
 
 /**
  * GET /api/categories/:id/path
- * Lấy đường dẫn đầy đủ của category (breadcrumb)
- * VD: Mỹ phẩm > Chăm sóc da > Kem dưỡng
- * 
- * Response:
- *   {
- *     ok: true,
- *     path: [ {...}, {...}, {...} ],  // Full category objects
- *     breadcrumb: [                   // Simplified for UI
- *       { _id: "...", name: "...", code: "..." }
- *     ]
- *   }
  */
 router.get(
   "/:id/path",
@@ -255,14 +197,15 @@ router.get(
       return res.status(404).json({ ok: false, message: "CATEGORY_NOT_FOUND" });
     }
 
-    // Lấy tất cả categories trong path
+    // ✅ FIX: Kiểm tra category.path
+    const categoryPath = Array.isArray(category.path) ? category.path : [];
+
     const pathCategories = await Category.find({
-      _id: { $in: category.path },
+      _id: { $in: categoryPath },
     })
       .sort({ level: 1 })
       .lean();
 
-    // Thêm category hiện tại vào cuối path
     const fullPath = [...pathCategories, category];
 
     res.json({
@@ -279,10 +222,6 @@ router.get(
 
 /**
  * GET /api/categories/:id/children
- * Lấy tất cả children trực tiếp của category (chỉ level 1)
- * 
- * Response:
- *   { ok: true, items: [...], total: number }
  */
 router.get(
   "/:id/children",
@@ -306,11 +245,6 @@ router.get(
 
 /**
  * GET /api/categories/:id/descendants
- * Lấy tất cả descendants (tất cả cấp con)
- * VD: Con, cháu, chắt... tất cả
- * 
- * Response:
- *   { ok: true, items: [...], total: number }
  */
 router.get(
   "/:id/descendants",
@@ -335,25 +269,12 @@ router.get(
 
 /**
  * POST /api/categories
- * Tạo category mới
- * 
- * Body:
- *   {
- *     code: string (required, min 2 chars),
- *     name: string (required, min 2 chars),
- *     parentId: string | null (optional),
- *     order: number (optional, default 0)
- *   }
- * 
- * Response:
- *   { ok: true, category: {...} }
  */
 router.post(
   "/",
   authRequired,
   requireRole(["ADMIN", "MANAGER"]),
   asyncHandler(async (req, res) => {
-    // Validate input
     const body = z
       .object({
         code: z.string().min(2),
@@ -369,7 +290,6 @@ router.post(
 
     const { code, name, parentId, order } = body.data;
 
-    // Check duplicate code
     const existingCode = await Category.findOne({
       code: code.toUpperCase(),
     });
@@ -380,22 +300,23 @@ router.post(
       });
     }
 
-    // Tính metadata (level, path, parentName) từ parentId
+    // ✅ FIX: Thêm try-catch
     let metadata;
     try {
       metadata = await calculateCategoryMetadata(parentId || null);
     } catch (error) {
-      return res.status(400).json({ ok: false, message: error.message });
+      return res.status(400).json({ 
+        ok: false, 
+        message: error.message || "CALCULATE_METADATA_ERROR" 
+      });
     }
 
-    // Tạo slug từ name
     const slug = name
       .toLowerCase()
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .replace(/\s+/g, "-");
 
-    // Tạo category mới
     const category = await Category.create({
       code: code.toUpperCase(),
       name: name.trim(),
@@ -414,21 +335,6 @@ router.post(
 
 /**
  * PUT /api/categories/:id
- * Update category
- * 
- * Body:
- *   {
- *     code?: string,
- *     name?: string,
- *     parentId?: string | null,
- *     order?: number,
- *     isActive?: boolean
- *   }
- * 
- * Note: Khi đổi parentId, sẽ tự động update path/level cho category và tất cả children
- * 
- * Response:
- *   { ok: true, category: {...} }
  */
 router.put(
   "/:id",
@@ -440,7 +346,6 @@ router.put(
       return res.status(400).json({ ok: false, message: "INVALID_CATEGORY_ID" });
     }
 
-    // Validate input
     const body = z
       .object({
         code: z.string().min(2).optional(),
@@ -462,7 +367,6 @@ router.put(
 
     const data = body.data;
 
-    // Check duplicate code (nếu đổi code)
     if (data.code && data.code.toUpperCase() !== category.code) {
       const existingCode = await Category.findOne({
         code: data.code.toUpperCase(),
@@ -476,13 +380,12 @@ router.put(
       }
     }
 
-    // Validate parentId và check circular reference
+    // ✅ FIX: Xử lý parentId change
     if (data.parentId !== undefined) {
       if (data.parentId && !mongoose.isValidObjectId(data.parentId)) {
         return res.status(400).json({ ok: false, message: "INVALID_PARENT_ID" });
       }
 
-      // Check circular reference (A không thể là con của chính A hoặc con của A)
       if (data.parentId) {
         const isCircular = await checkCircularReference(categoryId, data.parentId);
         if (isCircular) {
@@ -493,24 +396,28 @@ router.put(
         }
       }
 
-      // Nếu đổi parent, update metadata
       const currentParentId = category.parentId ? String(category.parentId) : null;
       const newParentId = data.parentId ? String(data.parentId) : null;
 
       if (currentParentId !== newParentId) {
-        // Calculate metadata mới
-        const metadata = await calculateCategoryMetadata(data.parentId || null);
-        category.level = metadata.level;
-        category.path = metadata.path;
-        category.parentName = metadata.parentName;
-        category.parentId = data.parentId || null;
+        // ✅ FIX: Thêm try-catch
+        try {
+          const metadata = await calculateCategoryMetadata(data.parentId || null);
+          category.level = metadata.level;
+          category.path = metadata.path;
+          category.parentName = metadata.parentName;
+          category.parentId = data.parentId || null;
 
-        // Update path và level cho tất cả children
-        await updateChildrenPaths(categoryId);
+          await updateChildrenPaths(categoryId);
+        } catch (error) {
+          return res.status(400).json({ 
+            ok: false, 
+            message: error.message || "UPDATE_METADATA_ERROR" 
+          });
+        }
       }
     }
 
-    // Update các fields khác
     if (data.code) {
       category.code = data.code.toUpperCase();
     }
@@ -523,7 +430,6 @@ router.put(
         .replace(/[\u0300-\u036f]/g, "")
         .replace(/\s+/g, "-");
 
-      // Update parentName cho các children
       await Category.updateMany(
         { parentId: categoryId },
         { parentName: data.name.trim() }
@@ -546,14 +452,6 @@ router.put(
 
 /**
  * DELETE /api/categories/:id
- * Xóa category (soft delete - set isActive = false)
- * 
- * Validation:
- *   - Không cho xóa nếu có children
- *   - Không cho xóa nếu có products (optional - uncomment code bên dưới)
- * 
- * Response:
- *   { ok: true, message: "CATEGORY_DELETED", category: {...} }
  */
 router.delete(
   "/:id",
@@ -565,7 +463,6 @@ router.delete(
       return res.status(400).json({ ok: false, message: "INVALID_CATEGORY_ID" });
     }
 
-    // Check có children không
     const hasChildren = await Category.countDocuments({
       parentId: categoryId,
     });
@@ -577,18 +474,6 @@ router.delete(
       });
     }
 
-    // Check có products không (optional - uncomment nếu cần)
-    // const Product = require('../models/Product');
-    // const hasProducts = await Product.countDocuments({ categoryId });
-    // if (hasProducts > 0) {
-    //   return res.status(400).json({
-    //     ok: false,
-    //     message: 'CANNOT_DELETE_CATEGORY_WITH_PRODUCTS',
-    //     productCount: hasProducts
-    //   });
-    // }
-
-    // Soft delete - set isActive = false
     const category = await Category.findByIdAndUpdate(
       categoryId,
       { isActive: false },
@@ -605,17 +490,6 @@ router.delete(
 
 /**
  * POST /api/categories/:id/move
- * Di chuyển category sang parent mới
- * 
- * Body:
- *   {
- *     newParentId: string | null
- *   }
- * 
- * Note: Sẽ tự động update path/level cho category và tất cả children
- * 
- * Response:
- *   { ok: true, message: "CATEGORY_MOVED", category: {...} }
  */
 router.post(
   "/:id/move",
@@ -627,7 +501,6 @@ router.post(
       return res.status(400).json({ ok: false, message: "INVALID_CATEGORY_ID" });
     }
 
-    // Validate input
     const body = z
       .object({
         newParentId: z.string().nullable(),
@@ -640,12 +513,10 @@ router.post(
 
     const { newParentId } = body.data;
 
-    // Validate new parent
     if (newParentId && !mongoose.isValidObjectId(newParentId)) {
       return res.status(400).json({ ok: false, message: "INVALID_PARENT_ID" });
     }
 
-    // Check circular reference
     if (newParentId) {
       const isCircular = await checkCircularReference(categoryId, newParentId);
       if (isCircular) {
@@ -661,21 +532,25 @@ router.post(
       return res.status(404).json({ ok: false, message: "CATEGORY_NOT_FOUND" });
     }
 
-    // Calculate new metadata
-    const metadata = await calculateCategoryMetadata(newParentId);
+    // ✅ FIX: Thêm try-catch
+    try {
+      const metadata = await calculateCategoryMetadata(newParentId);
 
-    // Update category
-    category.parentId = newParentId || null;
-    category.level = metadata.level;
-    category.path = metadata.path;
-    category.parentName = metadata.parentName;
+      category.parentId = newParentId || null;
+      category.level = metadata.level;
+      category.path = metadata.path;
+      category.parentName = metadata.parentName;
 
-    await category.save();
+      await category.save();
+      await updateChildrenPaths(categoryId);
 
-    // Update tất cả children paths
-    await updateChildrenPaths(categoryId);
-
-    res.json({ ok: true, message: "CATEGORY_MOVED", category });
+      res.json({ ok: true, message: "CATEGORY_MOVED", category });
+    } catch (error) {
+      return res.status(400).json({ 
+        ok: false, 
+        message: error.message || "MOVE_CATEGORY_ERROR" 
+      });
+    }
   })
 );
 
