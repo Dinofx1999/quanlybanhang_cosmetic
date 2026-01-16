@@ -10,6 +10,9 @@ const CategorySchema = new mongoose.Schema(
 
     order: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+
+    // Optional: Denormalize parent name for quick access
+    parentName: { type: String, default: "" },
   },
   { timestamps: true }
 );

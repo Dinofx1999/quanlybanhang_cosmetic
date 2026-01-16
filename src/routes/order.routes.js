@@ -1,11 +1,14 @@
 // src/routes/orders.routes.js
 const router = require("express").Router();
 const { z } = require("zod");
+const mongoose = require("mongoose");
 
 const Order = require("../models/Order");
 const Product = require("../models/Product");
+const ProductVariant = require("../models/ProductVariant");
 const Customer = require("../models/Customer");
 const Stock = require("../models/Stock");
+const VariantStock = require("../models/VariantStock");
 const LoyaltySetting = require("../models/LoyaltySetting");
 
 const { authRequired, requireRole } = require("../middlewares/auth");
@@ -22,9 +25,6 @@ const { onOrderConfirmedOrDone } = require("../services/loyalty.service");
  * ===============================
  * Redeem policy (Admin config)
  * ===============================
- * - amountPerPoint: 1 điểm đổi được bao nhiêu VND
- * - maxPercent: tối đa % của (subtotal - discount + extraFee)
- * - maxPoints: tối đa điểm cho 1 hoá đơn
  */
 async function getRedeemPolicy({ branchId }) {
   const fallback = {
@@ -66,52 +66,249 @@ function moneyInt(n) {
 
 /**
  * ===============================
- * Items builder
+ * ⭐ TierAgency pricing (Wholesale)
  * ===============================
+ * - Customer has tierAgencyId (ObjectId TierAgency)
+ * - Variant has price_tier: [{tierId, price}]
+ * - Product has price_tier / baseTier / pricingRules
+ * Priority:
+ * 1) Variant.price_tier[tierId]
+ * 2) Product.pricingRules (tier action if match)
+ * 3) Product.price_tier[tierId]
+ * 4) Product.baseTier[tierId]
+ * 5) Variant.price (retail)
+ * 6) Product.basePrice or Product.price
  */
-async function buildOrderItems(itemsIn) {
-  const ids = itemsIn.map((i) => i.productId);
-  const products = await Product.find({ _id: { $in: ids }, isActive: true }).lean();
-  const mapP = new Map(products.map((p) => [String(p._id), p]));
 
-  const items = itemsIn.map((i) => {
-    const p = mapP.get(String(i.productId));
-    if (!p) {
-      const err = new Error("PRODUCT_NOT_FOUND");
-      err.code = "PRODUCT_NOT_FOUND";
-      err.detail = `productId=${i.productId}`;
+function pickTierPriceFromArray(arr, tierAgencyId) {
+  const tid = String(tierAgencyId || "").trim();
+  if (!tid || !mongoose.isValidObjectId(tid)) return null;
+  const list = Array.isArray(arr) ? arr : [];
+  const found = list.find((x) => String(x?.tierId || "") === tid);
+  if (!found) return null;
+  const v = Number(found.price);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+function getAttrValue(attributes, key) {
+  const k = String(key || "").toLowerCase().trim();
+  const arr = Array.isArray(attributes) ? attributes : [];
+  const hit = arr.find((a) => String(a?.k || "").toLowerCase().trim() === k);
+  return hit ? String(hit.v || "").trim() : "";
+}
+
+function matchWhenClause(attributes, clause) {
+  const k = String(clause?.key || "").toLowerCase().trim();
+  const op = String(clause?.op || "eq").toLowerCase().trim();
+  const v = String(clause?.value || "").trim();
+  const actual = getAttrValue(attributes, k);
+
+  if (op === "eq") return actual === v;
+  if (op === "ne") return actual !== v;
+  if (op === "in") {
+    const set = v
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    return set.includes(actual);
+  }
+  if (op === "nin") {
+    const set = v
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    return !set.includes(actual);
+  }
+  return false;
+}
+
+function ruleMatches(attributes, rule) {
+  const whens = Array.isArray(rule?.when) ? rule.when : [];
+  if (!whens.length) return true;
+  return whens.every((c) => matchWhenClause(attributes, c));
+}
+
+function applyActionToPrice(price, action) {
+  const type = String(action?.type || "NONE").toUpperCase();
+  const amt = Number(action?.amount || 0);
+  if (type === "SET") return Math.max(0, moneyInt(amt));
+  if (type === "ADD") return Math.max(0, moneyInt(price + amt));
+  return price;
+}
+
+async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache }) {
+  const tid = String(tierAgencyId || "").trim();
+  const hasTier = !!tid && mongoose.isValidObjectId(tid);
+
+  // Base retail from variant
+  let retail = moneyInt(variant?.price || 0);
+
+  // 1) Variant.price_tier
+  if (hasTier) {
+    const vTier = pickTierPriceFromArray(variant?.price_tier, tid);
+    if (vTier != null) return moneyInt(vTier);
+  }
+
+  // Fetch product (cached)
+  let prod = null;
+  const pid = variant?.productId ? String(variant.productId) : "";
+  if (pid && mongoose.isValidObjectId(pid)) {
+    if (productCache.has(pid)) prod = productCache.get(pid);
+    else {
+      prod = await Product.findById(pid)
+        .select("_id price basePrice price_tier baseTier pricingRules")
+        .lean();
+      productCache.set(pid, prod || null);
+    }
+  }
+
+  // If variant retail missing, fallback from product
+  if (!retail && prod) retail = moneyInt(prod.basePrice ?? prod.price ?? 0);
+
+  // 2) Product.pricingRules
+  if (prod && Array.isArray(prod.pricingRules) && prod.pricingRules.length) {
+    const rules = [...prod.pricingRules].sort(
+      (a, b) => Number(a?.priority || 100) - Number(b?.priority || 100)
+    );
+
+    let curRetail = retail;
+    let curTier = null;
+
+    // base tier from product (price_tier > baseTier)
+    if (hasTier) {
+      const pTier = pickTierPriceFromArray(prod.price_tier, tid);
+      const bTier = pickTierPriceFromArray(prod.baseTier, tid);
+      curTier = pTier != null ? moneyInt(pTier) : bTier != null ? moneyInt(bTier) : null;
+    }
+
+    for (const r of rules) {
+      if (!ruleMatches(variant?.attributes, r)) continue;
+
+      curRetail = applyActionToPrice(curRetail, r.actionRetail);
+
+      if (hasTier && Array.isArray(r.actionTiers)) {
+        const a = r.actionTiers.find((x) => String(x?.tierId || "") === tid);
+        if (a) {
+          const next = applyActionToPrice(curTier ?? curRetail, a);
+          curTier = next;
+        }
+      }
+    }
+
+    if (hasTier && curTier != null) return moneyInt(curTier);
+    return moneyInt(curRetail);
+  }
+
+  // 3) Product.price_tier
+  if (hasTier && prod) {
+    const pTier = pickTierPriceFromArray(prod.price_tier, tid);
+    if (pTier != null) return moneyInt(pTier);
+  }
+
+  // 4) Product.baseTier
+  if (hasTier && prod) {
+    const bTier = pickTierPriceFromArray(prod.baseTier, tid);
+    if (bTier != null) return moneyInt(bTier);
+  }
+
+  // 5) Variant retail
+  if (retail) return moneyInt(retail);
+
+  // 6) Product fallback
+  if (prod) return moneyInt(prod.basePrice ?? prod.price ?? 0);
+
+  return 0;
+}
+
+/**
+ * ===============================
+ * ⭐ Items builder - VARIANT-BASED
+ * ===============================
+ * Accept: [{ productId: "variantId", qty: 1 }]
+ * Server auto-detects if it's a variant
+ */
+async function buildOrderItems(itemsIn, opts = {}) {
+  const items = [];
+  const tierAgencyId = String(opts?.tierAgencyId || "").trim();
+  const productCache = opts?.productCache || new Map();
+
+  for (const item of itemsIn) {
+    const productId = item.productId || item.itemId;
+    const qty = Number(item.qty || 0);
+
+    if (!productId) {
+      const err = new Error("MISSING_PRODUCT_ID");
+      err.code = "MISSING_PRODUCT_ID";
       throw err;
     }
-    const qty = Number(i.qty || 0);
-    const price = Number(p.price || 0);
-    return {
-      productId: i.productId,
-      sku: p.sku || "",
-      name: p.name || "",
+
+    if (!mongoose.isValidObjectId(productId)) {
+      const err = new Error("INVALID_PRODUCT_ID");
+      err.code = "INVALID_PRODUCT_ID";
+      err.detail = `productId=${productId}`;
+      throw err;
+    }
+
+    if (qty <= 0) {
+      const err = new Error("INVALID_QTY");
+      err.code = "INVALID_QTY";
+      throw err;
+    }
+
+    const variantId = new mongoose.Types.ObjectId(productId);
+
+    // ⭐ Find variant (sellable unit)
+    const variant = await ProductVariant.findById(variantId)
+      .select("_id productId sku name price price_tier attributes isActive")
+      .lean();
+
+    if (!variant || !variant.isActive) {
+      const err = new Error("VARIANT_NOT_FOUND");
+      err.code = "VARIANT_NOT_FOUND";
+      err.detail = `variantId=${productId} not found or inactive`;
+      throw err;
+    }
+
+    const price = await resolveSellPriceForVariant({ variant, tierAgencyId, productCache });
+
+    items.push({
+      variantId: variant._id,
+      productId: variant.productId, // parent product for reporting
+      sku: variant.sku || "",
+      name: variant.name || "",
+      attributes: variant.attributes || [],
       qty,
       price,
       total: qty * price,
-    };
-  });
+    });
+  }
 
   return items;
 }
 
 /**
- * allocate POS: single branch, allow negative stock (handled by upsert stock)
+ * ===============================
+ * ⭐ Stock allocation - VARIANT-BASED
+ * ===============================
  */
 async function allocatePosStockSingleBranch({ branchId, items }) {
   const allocations = [];
+
   for (const it of items) {
-    const need = Number(it.qty || 0);
-    allocations.push({ branchId, productId: it.productId, qty: need });
+    const qty = Number(it.qty || 0);
+    if (qty <= 0) continue;
+
+    allocations.push({
+      branchId,
+      variantId: it.variantId,
+      productId: it.productId, // optional for reporting
+      qty,
+    });
   }
+
   return allocations;
 }
 
-/**
- * ONLINE allocate: MAIN_BRANCH_ID only
- */
 async function allocateOnlineStockMainOnly({ mainBranchId, items }) {
   if (!mainBranchId) {
     const err = new Error("MISSING_MAIN_BRANCH_ID");
@@ -120,29 +317,35 @@ async function allocateOnlineStockMainOnly({ mainBranchId, items }) {
   }
 
   const allocations = [];
+
   for (const it of items) {
-    const need = Number(it.qty || 0);
-    if (!need || need <= 0) continue;
+    const qty = Number(it.qty || 0);
+    if (qty <= 0) continue;
 
     allocations.push({
       branchId: String(mainBranchId),
+      variantId: it.variantId,
       productId: it.productId,
-      qty: need,
+      qty,
     });
   }
+
   return allocations;
 }
 
 /**
- * apply stock delta (allow negative via upsert)
+ * ===============================
+ * ⭐ Apply stock delta - VARIANT-BASED
+ * ===============================
  */
 async function applyStockDelta(allocations, sign /* -1 subtract, +1 restore */) {
   for (const al of allocations || []) {
     const qty = Number(al.qty || 0) * Number(sign || 0);
-    if (!al.branchId || !al.productId || !qty) continue;
+    if (!al.branchId || !al.variantId || !qty) continue;
 
-    await Stock.findOneAndUpdate(
-      { branchId: al.branchId, productId: al.productId },
+    // ⭐ Update variant stock
+    await VariantStock.findOneAndUpdate(
+      { branchId: al.branchId, variantId: al.variantId },
       { $inc: { qty } },
       { upsert: true, new: true }
     );
@@ -188,11 +391,9 @@ function calcRedeem({ policy, customerPoints, requestedPoints, baseAmount }) {
 
   const ptsHave = Math.max(0, Math.floor(Number(customerPoints || 0)));
 
-  // max by admin caps
   const capPts = Math.max(0, Math.floor(Number(policy?.maxPoints ?? 0)));
   const maxPtsByCap = capPts > 0 ? Math.min(reqPts, capPts) : reqPts;
 
-  // max by percent of invoice
   const maxPercent = Number(policy?.maxPercent);
   let maxAmountByPercent = baseAmount;
   if (Number.isFinite(maxPercent) && maxPercent > 0 && maxPercent < 100) {
@@ -203,12 +404,10 @@ function calcRedeem({ policy, customerPoints, requestedPoints, baseAmount }) {
   const pts = Math.min(maxPtsByCap, ptsHave, maxPtsByPercent);
   if (pts <= 0) return { points: 0, amount: 0 };
 
-  // rounding
   let amount = pts * amountPerPoint;
   if (String(policy?.round || "").toUpperCase() === "ROUND") amount = Math.round(amount);
   else amount = Math.floor(amount);
 
-  // never exceed baseAmount
   if (amount > baseAmount) {
     const pts2 = Math.floor(baseAmount / amountPerPoint);
     return { points: pts2, amount: pts2 * amountPerPoint };
@@ -219,8 +418,7 @@ function calcRedeem({ policy, customerPoints, requestedPoints, baseAmount }) {
 
 /**
  * ===============================
- * NEW: GET /api/loyalty/setting
- * UI POSSection calls: GET /loyalty/setting
+ * GET /api/loyalty/setting
  * ===============================
  */
 router.get(
@@ -324,12 +522,6 @@ router.get(
 /**
  * ===============================
  * POST /api/orders
- * - POS: allow PENDING | CONFIRM | DEBT
- * - Multi payments
- * - Redeem:
- *    - UI final gửi: pointsRedeemed + pointsRedeemAmount
- *    - Backward: redeem.points
- * - Flow A: Apply loyalty ONLY when CONFIRM (và không redeem)
  * ===============================
  */
 router.post(
@@ -343,8 +535,12 @@ router.post(
 
         branchId: z.string().optional(),
 
+        // ✅ NEW: FE can send customerId only
+        customerId: z.string().optional(),
+
         customer: z
           .object({
+            _id: z.string().optional(), // ✅ allow FE send customer._id too
             phone: z.string().optional(),
             name: z.string().optional(),
             email: z.string().optional(),
@@ -381,11 +577,9 @@ router.post(
           })
           .optional(),
 
-        // ✅ new payload from UI
         pointsRedeemed: z.number().int().nonnegative().optional(),
         pointsRedeemAmount: z.number().nonnegative().optional(),
 
-        // ✅ backward compatible
         redeem: z
           .object({
             points: z.number().int().nonnegative(),
@@ -408,12 +602,10 @@ router.post(
     const data = body.data;
     const requestedStatus = data.status || "PENDING";
 
-    // POS requires branchId
     if (data.channel === "POS" && !data.branchId) {
       return res.status(400).json({ ok: false, message: "POS order requires branchId" });
     }
 
-    // ONLINE: only PENDING here
     if (data.channel === "ONLINE") {
       if (requestedStatus !== "PENDING") {
         return res.status(409).json({
@@ -423,23 +615,54 @@ router.post(
       }
     }
 
-    // Delivery normalize
     const delMethod = data.delivery?.method || "SHIP";
     const receiverName = String(data.customer?.name || "").trim();
     const receiverPhone = String(data.customer?.phone || "").trim();
 
-    // Rule: if SHIP => require phone + address
     if (delMethod === "SHIP") {
       const addr = String(data.delivery?.address || "").trim();
       if (!addr) return res.status(400).json({ ok: false, message: "SHIP requires delivery.address" });
       if (!receiverPhone) return res.status(400).json({ ok: false, message: "SHIP requires customer.phone" });
     }
 
-    // upsert customer if phone provided
+    // =========================
+    // ✅ Customer resolution
+    // =========================
     let customerId = null;
     let customerDoc = null;
+    let tierAgencyId = "";
 
-    if (data.customer?.phone) {
+    const incomingCustomerId = String(data.customerId || data.customer?._id || "").trim();
+    if (incomingCustomerId) {
+      if (!mongoose.isValidObjectId(incomingCustomerId)) {
+        return res.status(400).json({ ok: false, message: "Invalid customerId" });
+      }
+      customerDoc = await Customer.findById(incomingCustomerId);
+      if (!customerDoc) return res.status(400).json({ ok: false, message: "Customer not found" });
+
+      customerId = customerDoc._id;
+      tierAgencyId = String(customerDoc?.tierAgencyId || "").trim();
+
+      // Optional: update basic info if FE sends them
+      const setObj = {};
+      if (data.customer?.name != null) setObj.name = data.customer.name || "";
+      if (data.customer?.email != null) setObj.email = data.customer.email || "";
+      if (data.customer?.dob) {
+        const d = data.customer.dob instanceof Date ? data.customer.dob : new Date(String(data.customer.dob));
+        if (!isNaN(d.getTime())) setObj.dob = d;
+      }
+      if (data.customer?.tier) {
+        setObj["tier.code"] = String(data.customer.tier).toUpperCase().trim();
+        setObj.tierUpdatedAt = new Date();
+      }
+      if (Object.keys(setObj).length) {
+        customerDoc = await Customer.findByIdAndUpdate(customerId, { $set: setObj }, { new: true });
+        tierAgencyId = String(customerDoc?.tierAgencyId || tierAgencyId || "").trim();
+      }
+    }
+
+    // Fallback old behavior by phone if no customerId
+    if (!customerId && data.customer?.phone) {
       const setObj = {
         name: data.customer.name || "",
         email: data.customer.email || "",
@@ -455,16 +678,14 @@ router.post(
         setObj.tierUpdatedAt = new Date();
       }
 
-      customerDoc = await Customer.findOneAndUpdate(
-        { phone: data.customer.phone },
-        { $set: setObj },
-        { upsert: true, new: true }
-      );
-
+      customerDoc = await Customer.findOneAndUpdate({ phone: data.customer.phone }, { $set: setObj }, { upsert: true, new: true });
       customerId = customerDoc?._id || null;
+      tierAgencyId = String(customerDoc?.tierAgencyId || "").trim();
     }
 
-    const items = await buildOrderItems(data.items);
+    // ✅ Build items with server-truth pricing (retail or wholesale)
+    const productCache = new Map();
+    const items = await buildOrderItems(data.items, { tierAgencyId, productCache });
     const subtotal = moneyInt(items.reduce((s, it) => s + Number(it.total || 0), 0));
 
     const discount = moneyInt(data.discount || 0);
@@ -474,7 +695,6 @@ router.post(
       return res.status(400).json({ ok: false, message: `discount cannot exceed subtotal (${subtotal})` });
     }
 
-    // ===== Payments normalize =====
     let payments = [];
     if (Array.isArray(data.payments) && data.payments.length) {
       payments = normalizePayments(data.payments);
@@ -486,10 +706,6 @@ router.post(
 
     const sumPaid = moneyInt(sumPayments(payments));
 
-    // ===== Redeem (Flow A): ONLY when CONFIRM =====
-    // Accept both:
-    // - new: pointsRedeemed / pointsRedeemAmount
-    // - old: redeem.points
     let pointsRedeemed = 0;
     let pointsRedeemAmount = 0;
 
@@ -500,7 +716,6 @@ router.post(
     const requestedRedeemPoints = reqRedeemPointsFromNew || reqRedeemPointsFromOld;
 
     if (data.channel === "POS") {
-      // PENDING/DEBT: NOT allow redeem
       if ((requestedStatus === "PENDING" || requestedStatus === "DEBT") && requestedRedeemPoints > 0) {
         return res.status(400).json({ ok: false, message: "Redeem chỉ áp dụng khi CONFIRM (trả đủ)." });
       }
@@ -511,7 +726,6 @@ router.post(
         const baseAmount = Math.max(0, subtotal - discount + extraFee);
         const customerPoints = Number(customerDoc?.points || 0);
 
-        // Server ALWAYS recalculates by policy (do not trust client)
         const r = calcRedeem({
           policy,
           customerPoints,
@@ -522,9 +736,7 @@ router.post(
         pointsRedeemed = r.points;
         pointsRedeemAmount = r.amount;
 
-        // If client sent explicit amount, ensure it matches server calc (optional strict)
         if (reqRedeemPointsFromNew > 0) {
-          // allow small diff 0, because we use int money
           if (reqRedeemAmountFromNew !== 0 && reqRedeemAmountFromNew !== pointsRedeemAmount) {
             // Not fatal; choose server truth
           }
@@ -534,7 +746,6 @@ router.post(
 
     const total = Math.max(0, subtotal - discount - pointsRedeemAmount + extraFee);
 
-    // ===== Payment rules by status =====
     if (data.channel === "POS") {
       if (requestedStatus === "PENDING") {
         const hasNonPending = payments.some((p) => p.method !== "PENDING" && p.amount > 0);
@@ -560,11 +771,9 @@ router.post(
         const hasPendingMethod = payments.some((p) => p.method === "PENDING");
         if (hasPendingMethod) return res.status(400).json({ ok: false, message: "PENDING method chỉ dùng cho status=PENDING" });
         if (sumPaid > total) return res.status(400).json({ ok: false, message: `DEBT requires sum(payments) <= order.total (${total})` });
-        // allow 0..total
       }
     }
 
-    // ===== Create Order =====
     const order = await Order.create({
       code: genOrderCode(data.channel === "POS" ? "POS" : "ADM"),
       channel: data.channel,
@@ -578,7 +787,6 @@ router.post(
       extraFee,
       pricingNote: data.pricingNote || "",
 
-      // redeem fields (must exist in schema)
       pointsRedeemed,
       pointsRedeemAmount,
       pointsRedeemedAt: null,
@@ -606,21 +814,16 @@ router.post(
       refundedAt: null,
       refundNote: "",
 
-      // earn fields
       pointsEarned: 0,
       pointsAppliedAt: null,
       pointsRevertedAt: null,
       loyaltyAppliedAt: null,
 
-      // debt field (must exist in schema)
       debtAmount: requestedStatus === "DEBT" ? Math.max(0, total - sumPaid) : 0,
     });
 
-    // ===== Stock rules =====
-    // POS: subtract stock immediately (allow negative)
-    // ONLINE: PENDING doesn't subtract stock here
     if (data.channel === "POS") {
-      const needItems = order.items.map((x) => ({ productId: x.productId, qty: x.qty }));
+      const needItems = order.items.map((x) => ({ variantId: x.variantId, productId: x.productId, qty: x.qty }));
       const allocations = await allocatePosStockSingleBranch({
         branchId: String(order.branchId),
         items: needItems,
@@ -636,17 +839,12 @@ router.post(
 
       await order.save();
 
-      // ===== Trừ điểm redeem (idempotent) =====
       if (requestedStatus === "CONFIRM" && order.customerId && order.pointsRedeemed > 0 && !order.pointsRedeemedAt) {
-        await Customer.findByIdAndUpdate(
-          order.customerId,
-          { $inc: { points: -order.pointsRedeemed } }
-        );
+        await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: -order.pointsRedeemed } });
         order.pointsRedeemedAt = new Date();
         await order.save();
       }
 
-      // ===== Apply loyalty ONLY when CONFIRM and NOT redeem (Flow A) =====
       if (requestedStatus === "CONFIRM" && order.customerId && order.pointsRedeemed === 0) {
         await onOrderConfirmedOrDone({
           customerId: order.customerId,
@@ -664,11 +862,9 @@ router.post(
 /**
  * ===============================
  * POST /api/orders/:id/confirm
- * - PENDING -> CONFIRM
- * - Flow A: accept redeem by:
- *    - pointsRedeemed/pointsRedeemAmount (new)
- *    - redeem.points (old)
  * ===============================
+ * ✅ IMPORTANT:
+ * - Nếu order PENDING được tạo trước đó, ta rebuild lại items/subtotal/total theo tierAgencyId (POS) trước khi validate payments
  */
 router.post(
   "/:id/confirm",
@@ -696,11 +892,9 @@ router.post(
           })
           .optional(),
 
-        // new
         pointsRedeemed: z.number().int().nonnegative().optional(),
         pointsRedeemAmount: z.number().nonnegative().optional(),
 
-        // old
         redeem: z
           .object({
             points: z.number().int().nonnegative(),
@@ -722,7 +916,29 @@ router.post(
       return res.status(409).json({ ok: false, message: `Only PENDING can be confirmed. Current=${order.status}` });
     }
 
-    // normalize incoming payments
+    // ✅ Rebuild POS pricing server-truth by customer's tierAgencyId (if any)
+    if (String(order.channel) === "POS" && order.customerId) {
+      const customer = await Customer.findById(order.customerId).lean();
+      const tierAgencyId = String(customer?.tierAgencyId || "").trim();
+
+      if (tierAgencyId && mongoose.isValidObjectId(tierAgencyId)) {
+        // rebuild items by variantId + qty
+        const itemsIn = (order.items || []).map((it) => ({
+          productId: String(it.variantId || it.productId || ""),
+          qty: Number(it.qty || 0),
+        }));
+
+        const productCache = new Map();
+        const rebuilt = await buildOrderItems(itemsIn, { tierAgencyId, productCache });
+
+        const newSubtotal = moneyInt(rebuilt.reduce((s, it) => s + Number(it.total || 0), 0));
+        order.items = rebuilt;
+        order.subtotal = newSubtotal;
+
+        // note: total will be recalculated below (redeem part) as well
+      }
+    }
+
     let incoming = [];
     if (Array.isArray(body.data.payments) && body.data.payments.length) {
       incoming = normalizePayments(body.data.payments);
@@ -732,10 +948,9 @@ router.post(
       incoming = [];
     }
 
-    // For POS/ONLINE: choose finalPayments
     const finalPayments = order.payments && order.payments.length ? normalizePayments(order.payments) : incoming;
 
-    // ===== Redeem at confirm (Flow A) for POS only =====
+    // base total from current order (maybe rebuilt)
     let totalAmount = moneyInt(order.total || 0);
 
     if (String(order.channel) === "POS") {
@@ -745,6 +960,11 @@ router.post(
 
       const redeemPtsReq = reqRedeemPtsNew || reqRedeemPtsOld;
 
+      const baseAmount = Math.max(
+        0,
+        moneyInt(order.subtotal) - moneyInt(order.discount) + moneyInt(order.extraFee)
+      );
+
       if (redeemPtsReq > 0) {
         if (!order.customerId) return res.status(400).json({ ok: false, message: "Redeem requires customer" });
         if (!order.branchId) return res.status(400).json({ ok: false, message: "POS order missing branchId" });
@@ -753,9 +973,7 @@ router.post(
         const customerPoints = Number(customer?.points || 0);
 
         const policy = await getRedeemPolicy({ branchId: String(order.branchId) });
-        const baseAmount = Math.max(0, moneyInt(order.subtotal) - moneyInt(order.discount) + moneyInt(order.extraFee));
 
-        // always recalc
         const r = calcRedeem({
           policy,
           customerPoints,
@@ -770,13 +988,10 @@ router.post(
         totalAmount = Math.max(0, baseAmount - r.amount);
         order.total = totalAmount;
 
-        // optional: ignore client amount mismatch
         if (reqRedeemPtsNew > 0 && reqRedeemAmountNew && reqRedeemAmountNew !== r.amount) {
           // server truth wins
         }
       } else {
-        // if no redeem at confirm, ensure total is base
-        const baseAmount = Math.max(0, moneyInt(order.subtotal) - moneyInt(order.discount) + moneyInt(order.extraFee));
         order.pointsRedeemed = 0;
         order.pointsRedeemAmount = 0;
         order.pointsRedeemedAt = null;
@@ -785,9 +1000,7 @@ router.post(
       }
     }
 
-    // ===== Payment rules confirm =====
     if (String(order.channel) === "ONLINE") {
-      // ONLINE: if no payment => COD
       if (!finalPayments.length) {
         order.payments = [{ method: "COD", amount: totalAmount }];
       } else {
@@ -804,7 +1017,6 @@ router.post(
         order.payments = finalPayments;
       }
     } else {
-      // POS confirm requires payments sum == total
       if (finalPayments.some((p) => p.method === "COD")) {
         return res.status(400).json({ ok: false, message: "POS không dùng COD" });
       }
@@ -825,11 +1037,10 @@ router.post(
       order.payments = finalPayments;
     }
 
-    // ===== allocate & subtract stock (idempotent) =====
     const hasAlloc = Array.isArray(order.stockAllocations) && order.stockAllocations.length > 0;
 
     if (!hasAlloc) {
-      const needItems = order.items.map((x) => ({ productId: x.productId, qty: x.qty }));
+      const needItems = order.items.map((x) => ({ variantId: x.variantId, productId: x.productId, qty: x.qty }));
       let allocations = [];
 
       if (String(order.channel) === "ONLINE") {
@@ -843,24 +1054,18 @@ router.post(
       order.stockAllocations = allocations;
     }
 
-    // ===== confirm order =====
     order.status = "CONFIRM";
     order.confirmedAt = new Date();
     order.confirmedById = req.user.sub || null;
 
     await order.save();
 
-    // ===== Trừ điểm redeem (idempotent) =====
     if (order.customerId && order.pointsRedeemed > 0 && !order.pointsRedeemedAt) {
-      await Customer.findByIdAndUpdate(
-        order.customerId,
-        { $inc: { points: -order.pointsRedeemed } }
-      );
+      await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: -order.pointsRedeemed } });
       order.pointsRedeemedAt = new Date();
       await order.save();
     }
 
-    // ===== apply loyalty ONLY now and NOT redeem (Flow A) =====
     if (order.customerId && order.pointsRedeemed === 0) {
       await onOrderConfirmedOrDone({
         customerId: order.customerId,
@@ -877,9 +1082,6 @@ router.post(
 /**
  * ===============================
  * POST /api/orders/:id/payments
- * - Append payment(s) vào đơn DEBT
- * - Nếu tổng payments >= total → tự động CONFIRM
- * - Nếu tổng payments < total → vẫn DEBT
  * ===============================
  */
 router.post(
@@ -905,9 +1107,6 @@ router.post(
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ ok: false, message: "Order not found" });
 
-    // Chỉ cho phép append payment khi:
-    // 1. Status = DEBT
-    // 2. HOẶC Status = CONFIRM nhưng vẫn còn thiếu tiền (edge case)
     const currentStatus = String(order.status || "").toUpperCase();
     if (currentStatus !== "DEBT" && currentStatus !== "CONFIRM") {
       return res.status(409).json({
@@ -916,7 +1115,6 @@ router.post(
       });
     }
 
-    // Normalize incoming payments
     const incomingPayments = normalizePayments(body.data.payments);
     if (!incomingPayments.length) {
       return res.status(400).json({ ok: false, message: "Payments array cannot be empty" });
@@ -927,12 +1125,10 @@ router.post(
       return res.status(400).json({ ok: false, message: "Total payment amount must be > 0" });
     }
 
-    // Calculate current state
     const orderTotal = moneyInt(order.total || 0);
     const currentPaid = moneyInt(sumPayments(order.payments || []));
     const currentDue = Math.max(0, orderTotal - currentPaid);
 
-    // Check: không cho trả quá số còn thiếu
     if (incomingSum > currentDue) {
       return res.status(400).json({
         ok: false,
@@ -940,16 +1136,13 @@ router.post(
       });
     }
 
-    // Append payments
     const existingPayments = Array.isArray(order.payments) ? order.payments : [];
     order.payments = [...existingPayments, ...incomingPayments];
 
     const newPaidSum = moneyInt(sumPayments(order.payments));
     const newDue = Math.max(0, orderTotal - newPaidSum);
 
-    // Decision: CONFIRM or keep DEBT
     if (newDue === 0) {
-      // ✅ Trả đủ → CONFIRM
       order.status = "CONFIRM";
       order.confirmedAt = new Date();
       order.confirmedById = req.user.sub || null;
@@ -957,7 +1150,6 @@ router.post(
 
       await order.save();
 
-      // Apply loyalty (only if not redeemed)
       if (order.customerId && order.pointsRedeemed === 0) {
         await onOrderConfirmedOrDone({
           customerId: order.customerId,
@@ -974,7 +1166,6 @@ router.post(
         statusChanged: true,
       });
     } else {
-      // ✅ Trả thiếu → vẫn DEBT
       order.debtAmount = newDue;
       await order.save();
 
@@ -991,11 +1182,6 @@ router.post(
 /**
  * ===============================
  * PATCH /api/orders/:id/status
- * - Allow: PENDING -> CANCELLED
- * - CONFIRM -> SHIPPED
- * - SHIPPED -> REFUNDED
- * - DEBT -> CANCELLED
- * NOTE: DEBT -> CONFIRM is not handled here (you can add a /pay endpoint later).
  * ===============================
  */
 router.patch(
@@ -1040,7 +1226,6 @@ router.patch(
       return res.status(409).json({ ok: false, message: `Invalid transition ${prev} -> ${next}` });
     }
 
-    // ===== CANCELLED =====
     if (next === "CANCELLED") {
       const isPOS = String(order.channel || "").toUpperCase() === "POS";
       const hasAlloc = Array.isArray(order.stockAllocations) && order.stockAllocations.length > 0;
@@ -1050,14 +1235,12 @@ router.patch(
         order.stockAllocations = [];
       }
 
-      // revert earn
       await revertEarnPointsForOrder({
         order,
         userId: req.user.sub || null,
         reason: "REVERT_EARN_CANCELLED",
       });
 
-      // revert redeem (if already deducted by loyalty.service)
       const ptsRedeemed = Number(order.pointsRedeemed || 0);
       if (ptsRedeemed > 0 && order.pointsRedeemedAt && !order.pointsRedeemRevertedAt && order.customerId) {
         await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: +ptsRedeemed } });
@@ -1065,12 +1248,10 @@ router.patch(
       }
     }
 
-    // ===== SHIPPED =====
     if (next === "SHIPPED") {
       order.shippedAt = new Date();
     }
 
-    // ===== REFUNDED =====
     if (next === "REFUNDED") {
       order.refundedAt = new Date();
       order.refundNote = body.data.refundNote || "";

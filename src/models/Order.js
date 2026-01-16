@@ -1,18 +1,43 @@
 // src/models/Order.js
 const mongoose = require("mongoose");
 
+// ============================
+// Order Item (Variant-ready)
+// ============================
 const OrderItemSchema = new mongoose.Schema(
   {
-    productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
+    // ✅ NEW: variantId is the "sellable unit"
+    variantId: { type: mongoose.Schema.Types.ObjectId, ref: "ProductVariant", required: true },
+
+    // ✅ Keep productId for trace/reporting (optional but recommended)
+    productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", default: null },
+
+    // snapshots (avoid broken display if product changes)
     sku: { type: String, default: "" },
     name: { type: String, default: "" },
+
+    // optional: store attributes snapshot for receipt/reporting
+    // ex: [{k:"size", v:"100ml"}]
+    attributes: {
+      type: [
+        {
+          k: { type: String, required: true },
+          v: { type: String, required: true },
+        },
+      ],
+      default: [],
+    },
+
     qty: { type: Number, required: true },
-    price: { type: Number, required: true },
-    total: { type: Number, required: true },
+    price: { type: Number, required: true }, // unit price at purchase time
+    total: { type: Number, required: true }, // price * qty (after item-level calc if you add later)
   },
   { _id: false }
 );
 
+// ============================
+// Payment
+// ============================
 const PaymentSchema = new mongoose.Schema(
   {
     method: { type: String, enum: ["CASH", "BANK", "CARD", "COD", "WALLET", "PENDING"], required: true },
@@ -21,6 +46,9 @@ const PaymentSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ============================
+// Delivery
+// ============================
 const DeliverySchema = new mongoose.Schema(
   {
     method: { type: String, enum: ["PICKUP", "SHIP"], default: "SHIP" },
@@ -32,10 +60,19 @@ const DeliverySchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ============================
+// Stock Allocation (Variant-ready)
+// ============================
 const StockAllocationSchema = new mongoose.Schema(
   {
     branchId: { type: mongoose.Schema.Types.ObjectId, ref: "Branch", required: true },
-    productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
+
+    // ✅ NEW: allocate stock by variant
+    variantId: { type: mongoose.Schema.Types.ObjectId, ref: "ProductVariant", required: true },
+
+    // ✅ Keep productId optional for reporting
+    productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", default: null },
+
     qty: { type: Number, required: true },
   },
   { _id: false }
@@ -63,6 +100,9 @@ const LoyaltySnapshotSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ============================
+// Order
+// ============================
 const OrderSchema = new mongoose.Schema(
   {
     code: { type: String, unique: true, index: true, required: true },
@@ -71,7 +111,6 @@ const OrderSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      // ✅ add DEBT
       enum: ["PENDING", "CONFIRM", "DEBT", "SHIPPED", "CANCELLED", "REFUNDED"],
       default: "PENDING",
       index: true,
@@ -88,12 +127,15 @@ const OrderSchema = new mongoose.Schema(
 
     total: { type: Number, default: 0 },
 
+    // ✅ NOW: items are variant-based
     items: { type: [OrderItemSchema], default: [] },
+
     payments: { type: [PaymentSchema], default: [] },
     delivery: { type: DeliverySchema, default: {} },
 
     createdById: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 
+    // ✅ NOW: allocations are variant-based
     stockAllocations: { type: [StockAllocationSchema], default: [] },
 
     confirmedAt: { type: Date, default: null },
@@ -116,10 +158,6 @@ const OrderSchema = new mongoose.Schema(
 
     // ============================
     // Redeem (Flow A)
-    // - pointsRedeemed: số điểm thực tế dùng để giảm giá
-    // - pointsRedeemAmount: số tiền giảm tương ứng
-    // - pointsRedeemedAt: thời điểm đã TRỪ điểm ở Customer (idempotent)
-    // - pointsRedeemRevertedAt: thời điểm hoàn lại redeem khi CANCEL/REFUND
     // ============================
     pointsRedeemed: { type: Number, default: 0 },
     pointsRedeemAmount: { type: Number, default: 0 },
@@ -139,5 +177,9 @@ const OrderSchema = new mongoose.Schema(
 
 OrderSchema.index({ channel: 1, createdAt: -1 });
 OrderSchema.index({ branchId: 1, createdAt: -1 });
+
+// helpful indexes for variant-based queries
+OrderSchema.index({ "items.variantId": 1 });
+OrderSchema.index({ "stockAllocations.variantId": 1 });
 
 module.exports = mongoose.model("Order", OrderSchema);

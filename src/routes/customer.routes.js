@@ -12,19 +12,48 @@ function parseDob(v) {
 }
 
 // GET /api/customers?q=...
+// GET /api/customers?q=...
 router.get(
   "/",
   authRequired,
   asyncHandler(async (req, res) => {
     const q = String(req.query.q || "").trim();
+
     const filter = q
-      ? { $or: [{ phone: { $regex: q, $options: "i" } }, { name: { $regex: q, $options: "i" } }] }
+      ? {
+          $or: [
+            { phone: { $regex: q, $options: "i" } },
+            { name: { $regex: q, $options: "i" } },
+          ],
+        }
       : {};
 
-    const items = await Customer.find(filter).sort({ updatedAt: -1 }).limit(200).lean();
+    const docs = await Customer.find(filter)
+      .sort({ updatedAt: -1 })
+      .limit(200)
+      .populate({
+        path: "tierAgencyId",
+        select: "name level", // ✅ lấy name + level
+      })
+      .lean();
+
+    const items = docs.map((c) => {
+      const agency = c?.tierAgencyId;
+
+      return {
+        ...c,
+
+        // ✅ flatten ra cho FE dùng dễ
+        tierAgencyId: agency?._id || null,
+        tierAgencyName: agency?.name || "",
+        tierAgencyLevel: agency?.level ?? null,
+      };
+    });
+
     res.json({ ok: true, items });
   })
 );
+
 
 // GET /api/customers/:id?branchId=...
 router.get(
