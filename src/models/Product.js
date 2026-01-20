@@ -94,6 +94,30 @@ const ProductSchema = new mongoose.Schema(
 
     // Status
     isActive: { type: Boolean, default: true, index: true },
+
+     // ✅ Flash Sale fields
+    activeFlashSaleId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: "FlashSale",
+      default: null,
+      index: true 
+    },
+    
+    flashSalePrice: {
+      type: Number,
+      default: null,
+      min: 0
+    },
+    
+    flashSaleStartDate: {
+      type: Date,
+      default: null
+    },
+    
+    flashSaleEndDate: {
+      type: Date,
+      default: null
+    },
   },
   {
     timestamps: true,
@@ -111,6 +135,12 @@ ProductSchema.index(
     partialFilterExpression: { barcode: { $type: "string", $gt: "" } },
   }
 );
+// ✅ Indexes
+ProductSchema.index({ activeFlashSaleId: 1 });
+ProductSchema.index({ flashSalePrice: 1 });
+ProductSchema.index({ activeFlashSaleId: 1, isActive: 1 });
+ProductSchema.index({ flashSaleEndDate: 1 });
+
 ProductSchema.index({ name: "text", sku: "text" });
 ProductSchema.index({ brand: 1 });
 ProductSchema.index({ categoryId: 1 });

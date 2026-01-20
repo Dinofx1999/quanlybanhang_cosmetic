@@ -21,9 +21,9 @@ router.use("/loyalty-settings", require("./loyaltySettings.routes"));
 router.use("/tier-agencies", require("./tierAgency.routes"));
 router.use("/variant-stocks", require("./variantStocks"));
 
-    router.use("/product-variants", require("./productVariants"));
-    router.use("/variant-stocks", require("./variantStocks"));
-
+router.use("/product-variants", require("./productVariants"));
+router.use("/variant-stocks", require("./variantStocks"));
+router.use("/public", require("./public.routes"));
 
 
 module.exports = router;

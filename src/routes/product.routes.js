@@ -1620,4 +1620,819 @@ router.put(
   })
 );
 
+//NEW
+// src/routes/product.routes.js
+
+// ===============================
+// ✅ Helper: Lấy tất cả category con (copy từ categories.js)
+// ===============================
+async function getAllDescendantCategories(categoryId) {
+  const Category = require("../models/Category");
+  const descendants = [];
+  const queue = [categoryId];
+
+  while (queue.length > 0) {
+    const currentId = queue.shift();
+    const children = await Category.find({ parentId: currentId })
+      .select("_id")
+      .lean();
+
+    for (const child of children) {
+      descendants.push(child._id);
+      queue.push(child._id);
+    }
+  }
+
+  return descendants;
+}
+
+// ===============================
+// ✅ GET /api/products/by-category/:categoryId
+// Lấy products theo category (có option bao gồm category con)
+// ===============================
+router.get(
+  "/by-category/:categoryId",
+  authRequired,
+  asyncHandler(async (req, res) => {
+    const { categoryId } = req.params;
+    
+    if (!isValidObjectId(categoryId)) {
+      return res.status(400).json({ 
+        ok: false, 
+        message: "INVALID_CATEGORY_ID" 
+      });
+    }
+
+    const Category = require("../models/Category");
+    
+    // Kiểm tra category tồn tại
+    const category = await Category.findById(categoryId);
+    if (!category) {
+      return res.status(404).json({ 
+        ok: false, 
+        message: "CATEGORY_NOT_FOUND" 
+      });
+    }
+
+    // ✅ Query parameters
+    const includeSubcategories = String(req.query.includeSubcategories || "true") === "true";
+    const mode = String(req.query.mode || "product").toLowerCase();
+    const q = String(req.query.q || "").trim();
+    const brand = String(req.query.brand || "").trim();
+    const minPrice = req.query.minPrice !== undefined ? Number(req.query.minPrice) : null;
+    const maxPrice = req.query.maxPrice !== undefined ? Number(req.query.maxPrice) : null;
+    const isActive = req.query.isActive !== undefined ? String(req.query.isActive) === "true" : true;
+    
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const skip = (page - 1) * limit;
+    
+    const sortBy = String(req.query.sortBy || "updatedAt");
+    const sortOrder = req.query.sortOrder === "asc" ? 1 : -1;
+
+    // ✅ Resolve branchId
+    const role = getRole(req);
+    const branchResolved = resolveBranchId(req);
+    
+    if (role === "STAFF" && !branchResolved) {
+      return res.status(400).json({ ok: false, message: "STAFF_MISSING_BRANCH_ID" });
+    }
+
+    const isAll = branchResolved === "all";
+    const branchObjId = isAll ? null : toObjectIdOrNull(branchResolved);
+    
+    if (!isAll && !branchObjId) {
+      return res.status(400).json({ ok: false, message: "INVALID_BRANCH_ID" });
+    }
+
+    // ✅ Build category filter
+    let categoryIds = [new mongoose.Types.ObjectId(categoryId)];
+    
+    if (includeSubcategories) {
+      const descendants = await getAllDescendantCategories(categoryId);
+      categoryIds = [
+        new mongoose.Types.ObjectId(categoryId),
+        ...descendants.map(id => new mongoose.Types.ObjectId(id))
+      ];
+    }
+
+    // ===============================
+    // ✅ MODE: PRODUCT
+    // ===============================
+    if (mode === "product") {
+      const filter = { 
+        isActive,
+        categoryId: { $in: categoryIds }
+      };
+
+      if (brand) filter.brand = brand;
+      if (q) {
+        filter.$or = [
+          { name: { $regex: q, $options: "i" } },
+          { sku: { $regex: q, $options: "i" } },
+          { barcode: { $regex: q, $options: "i" } },
+        ];
+      }
+      
+      if (minPrice !== null || maxPrice !== null) {
+        filter.price = {};
+        if (minPrice !== null && !Number.isNaN(minPrice)) filter.price.$gte = minPrice;
+        if (maxPrice !== null && !Number.isNaN(maxPrice)) filter.price.$lte = maxPrice;
+      }
+
+      // Lookup variants -> variantstocks
+      const lookupVariants = [
+        {
+          $match: {
+            $expr: { 
+              $and: [
+                { $eq: ["$productId", "$$pid"] }, 
+                { $eq: ["$isActive", true] }
+              ] 
+            },
+          },
+        },
+        { $project: { _id: 1 } },
+      ];
+
+      const lookupVariantStocksByVariantIds = isAll
+        ? [
+            {
+              $match: {
+                $expr: { $in: ["$variantId", "$$vids"] },
+              },
+            },
+            { $group: { _id: null, totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ]
+        : [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $in: ["$variantId", "$$vids"] }, 
+                    { $eq: ["$branchId", branchObjId] }
+                  ],
+                },
+              },
+            },
+            { $group: { _id: null, totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ];
+
+      const aggP = await Product.aggregate([
+        { $match: filter },
+        {
+          $facet: {
+            items: [
+              { $sort: { [sortBy]: sortOrder } },
+              { $skip: skip },
+              { $limit: limit },
+
+              // Join variants
+              {
+                $lookup: {
+                  from: PRODUCT_VARIANTS_COLLECTION,
+                  let: { pid: "$_id" },
+                  pipeline: lookupVariants,
+                  as: "_vids",
+                },
+              },
+              {
+                $addFields: {
+                  _variantIds: {
+                    $cond: [
+                      { $gt: [{ $size: { $ifNull: ["$_vids", []] } }, 0] },
+                      { $map: { input: "$_vids", as: "x", in: "$$x._id" } },
+                      [
+                        {
+                          $cond: [
+                            { $and: [{ $ne: ["$defaultVariantId", null] }, { $ne: ["$defaultVariantId", ""] }] },
+                            "$defaultVariantId",
+                            null,
+                          ],
+                        },
+                      ],
+                    ],
+                  },
+                },
+              },
+              {
+                $addFields: {
+                  _variantIds: {
+                    $filter: { input: "$_variantIds", as: "id", cond: { $ne: ["$$id", null] } },
+                  },
+                },
+              },
+
+              // Sum variantstocks
+              {
+                $lookup: {
+                  from: VARIANT_STOCKS_COLLECTION,
+                  let: { vids: "$_variantIds" },
+                  pipeline: lookupVariantStocksByVariantIds,
+                  as: "_stock",
+                },
+              },
+              { $addFields: { _s0: { $arrayElemAt: ["$_stock", 0] } } },
+              { $addFields: { stock: { $ifNull: ["$_s0.totalQty", 0] } } },
+
+              { $project: { _vids: 0, _variantIds: 0, _stock: 0, _s0: 0 } },
+            ],
+            total: [{ $count: "count" }],
+          },
+        },
+      ]);
+
+      const items = aggP?.[0]?.items || [];
+      const total = aggP?.[0]?.total?.[0]?.count || 0;
+
+      return res.json({
+        ok: true,
+        category: {
+          _id: category._id,
+          name: category.name,
+          code: category.code,
+          level: category.level,
+        },
+        includeSubcategories,
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        branchId: isAll ? null : String(branchObjId),
+        items,
+        mode: "product",
+      });
+    }
+
+    // ===============================
+    // ✅ MODE: VARIANT
+    // ===============================
+    if (mode === "variant") {
+      const filterV = { isActive };
+
+      if (q) {
+        filterV.$or = [
+          { name: { $regex: q, $options: "i" } },
+          { sku: { $regex: q, $options: "i" } },
+          { barcode: { $regex: q, $options: "i" } },
+        ];
+      }
+
+      const priceMatch = {};
+      if (minPrice !== null && !Number.isNaN(minPrice)) priceMatch.$gte = minPrice;
+      if (maxPrice !== null && !Number.isNaN(maxPrice)) priceMatch.$lte = maxPrice;
+
+      const lookupStockPipeline = isAll
+        ? [
+            { $match: { $expr: { $eq: ["$variantId", "$$vid"] } } },
+            { $group: { _id: "$variantId", totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ]
+        : [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$variantId", "$$vid"] }, 
+                    { $eq: ["$branchId", branchObjId] }
+                  ],
+                },
+              },
+            },
+            { $group: { _id: "$variantId", totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ];
+
+      const aggV = await ProductVariant.aggregate([
+        { $match: filterV },
+
+        // Join product
+        {
+          $lookup: {
+            from: "products",
+            localField: "productId",
+            foreignField: "_id",
+            as: "_p",
+          },
+        },
+        { $addFields: { _p0: { $arrayElemAt: ["$_p", 0] } } },
+
+        // Filter by category
+        {
+          $match: {
+            "_p0.categoryId": { $in: categoryIds }
+          }
+        },
+
+        ...(brand ? [{ $match: { "_p0.brand": brand } }] : []),
+        ...(Object.keys(priceMatch).length ? [{ $match: { price: priceMatch } }] : []),
+
+        {
+          $facet: {
+            items: [
+              { $sort: { [sortBy]: sortOrder } },
+              { $skip: skip },
+              { $limit: limit },
+
+              // Join stock
+              {
+                $lookup: {
+                  from: VARIANT_STOCKS_COLLECTION,
+                  let: { vid: "$_id" },
+                  pipeline: lookupStockPipeline,
+                  as: "_stock",
+                },
+              },
+              { $addFields: { _s0: { $arrayElemAt: ["$_stock", 0] } } },
+              { $addFields: { stock: { $ifNull: ["$_s0.totalQty", 0] } } },
+
+              {
+                $project: {
+                  _id: 1,
+                  productId: 1,
+                  attributes: 1,
+                  sku: 1,
+                  name: 1,
+                  barcode: 1,
+                  cost: 1,
+                  price: 1,
+                  price_tier: 1,
+                  isActive: 1,
+                  stock: 1,
+                  brand: { $ifNull: ["$_p0.brand", ""] },
+                  categoryId: { $ifNull: ["$_p0.categoryId", null] },
+                  categoryName: { $ifNull: ["$_p0.categoryName", ""] },
+                  thumbnail: {
+                    $cond: [
+                      { $and: [{ $ne: ["$thumbnail", null] }, { $ne: ["$thumbnail", ""] }] },
+                      "$thumbnail",
+                      { $ifNull: ["$_p0.thumbnail", ""] },
+                    ],
+                  },
+                  images: {
+                    $cond: [
+                      { $gt: [{ $size: { $ifNull: ["$images", []] } }, 0] },
+                      "$images",
+                      { $ifNull: ["$_p0.images", []] },
+                    ],
+                  },
+                },
+              },
+            ],
+            total: [{ $count: "count" }],
+          },
+        },
+      ]);
+
+      const items = aggV?.[0]?.items || [];
+      const total = aggV?.[0]?.total?.[0]?.count || 0;
+
+      return res.json({
+        ok: true,
+        category: {
+          _id: category._id,
+          name: category.name,
+          code: category.code,
+          level: category.level,
+        },
+        includeSubcategories,
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        branchId: isAll ? null : String(branchObjId),
+        items,
+        mode: "variant",
+      });
+    }
+
+    // ===============================
+    // ✅ MODE: POS
+    // ===============================
+    if (mode === "pos") {
+      const baseProductFilter = { 
+        isActive,
+        categoryId: { $in: categoryIds }
+      };
+
+      if (brand) baseProductFilter.brand = brand;
+      if (q) {
+        baseProductFilter.$or = [
+          { name: { $regex: q, $options: "i" } },
+          { sku: { $regex: q, $options: "i" } },
+          { barcode: { $regex: q, $options: "i" } },
+        ];
+      }
+
+      const lookupVariantStock = isAll
+        ? [
+            { $match: { $expr: { $eq: ["$variantId", "$$vid"] } } },
+            { $group: { _id: "$variantId", totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ]
+        : [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$variantId", "$$vid"] }, 
+                    { $eq: ["$branchId", branchObjId] }
+                  ],
+                },
+              },
+            },
+            { $group: { _id: "$variantId", totalQty: { $sum: { $ifNull: ["$qty", 0] } } } },
+          ];
+
+      const agg = await Product.aggregate([
+        { $match: baseProductFilter },
+
+        // Join variants
+        {
+          $lookup: {
+            from: PRODUCT_VARIANTS_COLLECTION,
+            let: { pid: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ["$productId", "$$pid"] }, 
+                      { $eq: ["$isActive", true] }
+                    ],
+                  },
+                },
+              },
+            ],
+            as: "_variants",
+          },
+        },
+
+        // Build sellables
+        {
+          $addFields: {
+            _sellables: {
+              $cond: [
+                { $gt: [{ $size: { $ifNull: ["$_variants", []] } }, 0] },
+                {
+                  $map: {
+                    input: "$_variants",
+                    as: "v",
+                    in: {
+                      _id: "$$v._id",
+                      isVariant: true,
+                      productId: "$$v.productId",
+                      sku: "$$v.sku",
+                      name: { $ifNull: ["$$v.name", "$name"] },
+                      barcode: { $ifNull: ["$$v.barcode", ""] },
+                      cost: { $ifNull: ["$$v.cost", "$cost"] },
+                      price: { $ifNull: ["$$v.price", "$price"] },
+                      price_tier: {
+                        $cond: [
+                          { $gt: [{ $size: { $ifNull: ["$$v.price_tier", []] } }, 0] },
+                          "$$v.price_tier",
+                          { $ifNull: ["$price_tier", []] },
+                        ],
+                      },
+                      thumbnail: {
+                        $cond: [
+                          { $and: [{ $ne: ["$$v.thumbnail", null] }, { $ne: ["$$v.thumbnail", ""] }] },
+                          "$$v.thumbnail",
+                          { $ifNull: ["$thumbnail", ""] },
+                        ],
+                      },
+                      images: {
+                        $cond: [
+                          { $gt: [{ $size: { $ifNull: ["$$v.images", []] } }, 0] },
+                          "$$v.images",
+                          { $ifNull: ["$images", []] },
+                        ],
+                      },
+                      brand: { $ifNull: ["$brand", ""] },
+                      categoryId: { $ifNull: ["$categoryId", null] },
+                      categoryName: { $ifNull: ["$categoryName", ""] },
+                      attributes: { $ifNull: ["$$v.attributes", []] },
+                    },
+                  },
+                },
+                [
+                  {
+                    _id: "$defaultVariantId",
+                    isVariant: true,
+                    productId: "$_id",
+                    sku: "$sku",
+                    name: "$name",
+                    barcode: { $ifNull: ["$barcode", ""] },
+                    cost: { $ifNull: ["$cost", 0] },
+                    price: { $ifNull: ["$price", 0] },
+                    price_tier: { $ifNull: ["$price_tier", []] },
+                    thumbnail: { $ifNull: ["$thumbnail", ""] },
+                    images: { $ifNull: ["$images", []] },
+                    brand: { $ifNull: ["$brand", ""] },
+                    categoryId: { $ifNull: ["$categoryId", null] },
+                    categoryName: { $ifNull: ["$categoryName", ""] },
+                    attributes: [],
+                  },
+                ],
+              ],
+            },
+          },
+        },
+
+        { $unwind: "$_sellables" },
+
+        // Join stock
+        {
+          $lookup: {
+            from: VARIANT_STOCKS_COLLECTION,
+            let: { vid: "$_sellables._id" },
+            pipeline: lookupVariantStock,
+            as: "_vstock",
+          },
+        },
+        { $addFields: { _vs0: { $arrayElemAt: ["$_vstock", 0] } } },
+        { $addFields: { stock: { $ifNull: ["$_vs0.totalQty", 0] } } },
+
+        { $match: { "_sellables._id": { $ne: null } } },
+
+        {
+          $project: {
+            _id: "$_sellables._id",
+            isVariant: "$_sellables.isVariant",
+            productId: "$_sellables.productId",
+            sku: "$_sellables.sku",
+            name: "$_sellables.name",
+            brand: "$_sellables.brand",
+            categoryId: "$_sellables.categoryId",
+            categoryName: "$_sellables.categoryName",
+            barcode: "$_sellables.barcode",
+            cost: "$_sellables.cost",
+            price: "$_sellables.price",
+            price_tier: "$_sellables.price_tier",
+            thumbnail: "$_sellables.thumbnail",
+            images: "$_sellables.images",
+            attributes: "$_sellables.attributes",
+            isActive: "$isActive",
+            stock: 1,
+            updatedAt: "$updatedAt",
+            createdAt: "$createdAt",
+          },
+        },
+
+        ...(minPrice !== null || maxPrice !== null
+          ? [
+              {
+                $match: {
+                  price: {
+                    ...(minPrice !== null && !Number.isNaN(minPrice) ? { $gte: minPrice } : {}),
+                    ...(maxPrice !== null && !Number.isNaN(maxPrice) ? { $lte: maxPrice } : {}),
+                  },
+                },
+              },
+            ]
+          : []),
+
+        {
+          $facet: {
+            items: [
+              { $sort: { [sortBy]: sortOrder } },
+              { $skip: skip },
+              { $limit: limit }
+            ],
+            total: [{ $count: "count" }],
+          },
+        },
+      ]);
+
+      const items = agg?.[0]?.items || [];
+      const total = agg?.[0]?.total?.[0]?.count || 0;
+
+      return res.json({
+        ok: true,
+        category: {
+          _id: category._id,
+          name: category.name,
+          code: category.code,
+          level: category.level,
+        },
+        includeSubcategories,
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        branchId: isAll ? null : String(branchObjId),
+        items,
+        mode: "pos",
+      });
+    }
+
+    // Default fallback
+    return res.status(400).json({ 
+      ok: false, 
+      message: "INVALID_MODE" 
+    });
+  })
+);
+
+// ===============================
+// GET /api/products/flash-sale - Lấy products đang flash sale
+// ===============================
+router.get(
+  "/flash-sale",
+  authRequired,
+  asyncHandler(async (req, res) => {
+    const branchId = req.query.branchId ? String(req.query.branchId) : null;
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const skip = (page - 1) * limit;
+
+    const query = {
+      isActive: true,
+      activeFlashSaleId: { $ne: null },
+      flashSaleEndDate: { $gte: new Date() }
+    };
+
+    const [items, total] = await Promise.all([
+      Product.find(query)
+        .populate("activeFlashSaleId", "name code startDate endDate")
+        .sort({ flashSaleStartDate: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Product.countDocuments(query)
+    ]);
+
+    res.json({
+      ok: true,
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    });
+  })
+);
+
+// ===============================
+// ✅ PUT /variants/:id  (UPDATE VARIANT)
+// URL: /api/products/variants/:id
+// ===============================
+router.put(
+  "/variants/:id",
+  authRequired,
+  requireRole(["ADMIN", "MANAGER"]),
+  asyncHandler(async (req, res) => {
+    const variantId = req.params.id;
+    if (!isValidObjectId(variantId)) return res.status(400).json({ ok: false, message: "INVALID_VARIANT_ID" });
+
+    const body = z
+      .object({
+        sku: z.string().min(2).optional(),
+        barcode: z.string().optional(),
+        name: z.string().min(1).optional(),
+
+        // attributes: [{k,v}]
+        attributes: z.array(z.object({ k: z.string().min(1), v: z.string().min(1) })).optional(),
+
+        price: z.number().nonnegative().optional(),
+        cost: z.number().nonnegative().optional(),
+        price_tier: z.array(z.object({ tierId: z.string(), price: z.number().nonnegative() })).optional(),
+
+        thumbnail: z.string().optional(),
+        images: z.array(z.object({ url: z.string(), isPrimary: z.boolean().optional(), order: z.number().optional() })).optional(),
+
+        isActive: z.boolean().optional(),
+        isDefault: z.boolean().optional(),
+      })
+      .safeParse(req.body);
+
+    if (!body.success) return res.status(400).json({ ok: false, error: body.error.flatten() });
+
+    const patch = { ...body.data };
+
+    // normalize money
+    if (patch.price !== undefined) patch.price = Math.round(Number(patch.price || 0));
+    if (patch.cost !== undefined) patch.cost = Math.round(Number(patch.cost || 0));
+
+    // normalize price_tier
+    if ("price_tier" in patch) {
+      try {
+        patch.price_tier = normalizePriceTier(patch.price_tier);
+      } catch (e) {
+        return res.status(400).json({ ok: false, message: String(e?.code || e?.message || "INVALID_PRICE_TIER") });
+      }
+    }
+
+    // normalize attributes
+    if ("attributes" in patch) {
+      patch.attributes = (patch.attributes || [])
+        .map((x) => ({ k: String(x.k || "").trim(), v: String(x.v || "").trim() }))
+        .filter((x) => x.k && x.v);
+    }
+
+    // normalize images + thumbnail
+    if ("images" in patch) {
+      let images = (patch.images || [])
+        .map((img) => ({
+          url: normalizeUrl(img.url),
+          isPrimary: !!img.isPrimary,
+          order: Number(img.order || 0),
+        }))
+        .filter((x) => x.url);
+
+      let thumbnail = "thumbnail" in patch ? normalizeUrl(patch.thumbnail) : "";
+
+      if (!thumbnail && images.length) {
+        const primary = images.find((x) => x.isPrimary) || images[0];
+        thumbnail = primary.url;
+      }
+
+      if (thumbnail && images.length) {
+        const { next } = ensureOnePrimary(images, thumbnail);
+        images = next;
+      }
+
+      patch.images = images;
+      if ("thumbnail" in patch) patch.thumbnail = thumbnail;
+    } else if ("thumbnail" in patch) {
+      patch.thumbnail = normalizeUrl(patch.thumbnail);
+    }
+
+    // update variant
+    const vdoc = await ProductVariant.findByIdAndUpdate(variantId, { $set: patch }, { new: true });
+    if (!vdoc) return res.status(404).json({ ok: false, message: "VARIANT_NOT_FOUND" });
+
+    // nếu set isDefault=true => unset default của các variant khác cùng product
+    if (patch.isDefault === true && vdoc.productId) {
+      await ProductVariant.updateMany(
+        { productId: vdoc.productId, _id: { $ne: vdoc._id } },
+        { $set: { isDefault: false } }
+      );
+
+      // đồng bộ defaultVariantId lên Product
+      await Product.updateOne({ _id: vdoc.productId }, { $set: { defaultVariantId: vdoc._id, hasVariants: true } });
+    }
+
+    const ver = await nextVersion();
+    await ChangeLog.create({
+      branchId: null,
+      collection: PRODUCT_VARIANTS_COLLECTION,
+      docId: vdoc._id,
+      action: "UPSERT",
+      version: ver,
+    });
+
+    res.json({ ok: true, variant: vdoc, version: ver });
+  })
+);
+
+// ===============================
+// ✅ POST /variants/:id/images (UPLOAD IMAGES)
+// ===============================
+router.post(
+  "/variants/:id/images",
+  authRequired,
+  requireRole(["ADMIN", "MANAGER"]),
+  upload.array("files", 8),
+  asyncHandler(async (req, res) => {
+    const variantId = req.params.id;
+    if (!isValidObjectId(variantId)) return res.status(400).json({ ok: false, message: "INVALID_VARIANT_ID" });
+
+    const vdoc = await ProductVariant.findById(variantId);
+    if (!vdoc) return res.status(404).json({ ok: false, message: "VARIANT_NOT_FOUND" });
+
+    const uploadedFiles = Array.isArray(req.files) ? req.files : [];
+    if (!uploadedFiles || uploadedFiles.length === 0) {
+      return res.status(400).json({ ok: false, message: "NO_FILES" });
+    }
+
+    const primaryIndex = Number(req.query.primaryIndex || 0);
+
+    const newImages = uploadedFiles.map((file, idx) => ({
+      url: `/uploads/${file.filename}`,
+      isPrimary: idx === primaryIndex,
+      order: idx,
+    }));
+
+    const existingImages = Array.isArray(vdoc.images) ? vdoc.images : [];
+    const allImages = [...existingImages.map(img => ({ ...img, isPrimary: false })), ...newImages];
+
+    const { next } = ensureOnePrimary(allImages, newImages[primaryIndex]?.url || "");
+    const thumbnail = next.find(x => x.isPrimary)?.url || (newImages[primaryIndex]?.url || "");
+
+    vdoc.images = next;
+    vdoc.thumbnail = thumbnail;
+    await vdoc.save();
+
+    const ver = await nextVersion();
+    await ChangeLog.create({
+      branchId: null,
+      collection: PRODUCT_VARIANTS_COLLECTION,
+      docId: vdoc._id,
+      action: "UPSERT",
+      version: ver,
+    });
+
+    res.json({ ok: true, variant: vdoc, images: next, thumbnail, version: ver });
+  })
+);
+
+
 module.exports = router;
