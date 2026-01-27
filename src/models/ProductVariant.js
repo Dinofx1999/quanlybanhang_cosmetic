@@ -65,6 +65,32 @@ const ProductVariantSchema = new mongoose.Schema(
     
     // Status
     isActive: { type: Boolean, default: true, index: true },
+
+
+    // ✅ Flash Sale fields
+    activeFlashSaleId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: "FlashSale",
+      default: null,
+      index: true 
+    },
+    
+    flashSalePrice: {
+      type: Number,
+      default: null,
+      min: 0
+    },
+    
+    flashSaleStartDate: {
+      type: Date,
+      default: null
+    },
+    
+    flashSaleEndDate: {
+      type: Date,
+      default: null,
+      index: true
+    },
   },
   { 
     timestamps: true,
@@ -84,5 +110,9 @@ ProductVariantSchema.index({
 ProductVariantSchema.index({ productId: 1, isActive: 1 });
 ProductVariantSchema.index({ name: "text", sku: "text" });
 ProductVariantSchema.index({ productId: 1, isDefault: 1 });
+// ✅ Indexes for flash sale
+ProductVariantSchema.index({ activeFlashSaleId: 1 });
+ProductVariantSchema.index({ activeFlashSaleId: 1, isActive: 1 });
+ProductVariantSchema.index({ flashSaleEndDate: 1 });
 
 module.exports = mongoose.model("ProductVariant", ProductVariantSchema);

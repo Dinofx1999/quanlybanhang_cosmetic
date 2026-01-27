@@ -14,6 +14,7 @@ router.use("/stock-total", require("./stockTotal.routes"));
 router.use("/inbounds", require("./inbound.routes"));
 router.use("/receipt-templates", require("./receiptTemplates"));
 router.use("/uploads", require("./upload.routes"));
+router.use("/flashsales", require("./flashsale.routes"));
 
 // ✅ ADD:
 router.use("/tiers", require("./tiers.routes"));

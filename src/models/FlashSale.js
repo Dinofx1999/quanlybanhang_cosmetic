@@ -1,24 +1,24 @@
 // src/models/FlashSale.js
 const mongoose = require("mongoose");
 
-// Schema cho sản phẩm tham gia flash sale
-const FlashSaleProductSchema = new mongoose.Schema(
+// ===============================
+// Schema cho variant trong flash sale
+// ===============================
+const FlashSaleVariantSchema = new mongoose.Schema(
   {
-    productId: { 
+    variantId: { 
       type: mongoose.Schema.Types.ObjectId, 
-      ref: "Product", 
+      ref: "ProductVariant", 
       required: true,
       index: true 
     },
     
-    // ✅ Giá flash sale
     flashPrice: { 
       type: Number, 
       required: true, 
       min: 0 
     },
     
-    // ✅ Giảm giá theo %
     discountPercent: { 
       type: Number, 
       min: 0, 
@@ -26,39 +26,33 @@ const FlashSaleProductSchema = new mongoose.Schema(
       default: 0 
     },
     
-    // ✅ Số lượng giới hạn cho flash sale
     limitedQuantity: { 
       type: Number, 
       min: 0,
-      default: null  // null = không giới hạn
+      default: null
     },
     
-    // ✅ Số lượng đã bán trong flash sale
     soldQuantity: { 
       type: Number, 
       default: 0,
       min: 0 
     },
     
-    // ✅ Số lượng tối đa 1 khách có thể mua
     maxPerCustomer: { 
       type: Number, 
-      default: null  // null = không giới hạn
+      default: null
     },
     
-    // ✅ Trạng thái
     isActive: { 
       type: Boolean, 
       default: true 
     },
     
-    // ✅ Thứ tự hiển thị
     order: { 
       type: Number, 
       default: 0 
     },
     
-    // ✅ Badge/Label (VD: "HOT", "BÁN CHẠY")
     badge: {
       type: String,
       trim: true,
@@ -68,9 +62,11 @@ const FlashSaleProductSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ===============================
+// Schema chính cho Flash Sale
+// ===============================
 const FlashSaleSchema = new mongoose.Schema(
   {
-    // ✅ Thông tin cơ bản
     name: { 
       type: String, 
       required: true, 
@@ -93,7 +89,6 @@ const FlashSaleSchema = new mongoose.Schema(
       default: "" 
     },
     
-    // ✅ Thời gian
     startDate: { 
       type: Date, 
       required: true,
@@ -106,13 +101,11 @@ const FlashSaleSchema = new mongoose.Schema(
       index: true 
     },
     
-    // ✅ Danh sách sản phẩm
-    products: { 
-      type: [FlashSaleProductSchema], 
+    variants: { 
+      type: [FlashSaleVariantSchema], 
       default: [] 
     },
     
-    // ✅ Hình ảnh banner
     banner: { 
       type: String, 
       default: "" 
@@ -123,26 +116,22 @@ const FlashSaleSchema = new mongoose.Schema(
       order: { type: Number, default: 0 }
     }],
     
-    // ✅ Áp dụng cho chi nhánh nào
     branchIds: [{ 
       type: mongoose.Schema.Types.ObjectId, 
       ref: "Branch" 
-    }],  // [] = tất cả chi nhánh
+    }],
     
-    // ✅ Áp dụng cho tier khách hàng nào
     tierIds: [{ 
       type: mongoose.Schema.Types.ObjectId, 
       ref: "TierAgency" 
-    }],  // [] = tất cả tier
+    }],
     
-    // ✅ Priority (flash sale nào ưu tiên hơn nếu sản phẩm nằm trong nhiều chương trình)
     priority: { 
       type: Number, 
       default: 0,
       index: true 
     },
     
-    // ✅ Trạng thái
     status: {
       type: String,
       enum: ["DRAFT", "SCHEDULED", "ACTIVE", "ENDED", "CANCELLED"],
@@ -156,7 +145,6 @@ const FlashSaleSchema = new mongoose.Schema(
       index: true 
     },
     
-    // ✅ Metadata
     createdBy: { 
       type: mongoose.Schema.Types.ObjectId, 
       ref: "User" 
@@ -173,14 +161,18 @@ const FlashSaleSchema = new mongoose.Schema(
   }
 );
 
-// ✅ Indexes
+// ===============================
+// Indexes
+// ===============================
 FlashSaleSchema.index({ code: 1 }, { unique: true });
 FlashSaleSchema.index({ status: 1, isActive: 1 });
 FlashSaleSchema.index({ startDate: 1, endDate: 1 });
-FlashSaleSchema.index({ "products.productId": 1 });
+FlashSaleSchema.index({ "variants.variantId": 1 });
 FlashSaleSchema.index({ priority: -1 });
 
-// ✅ Virtual: Kiểm tra flash sale đang active
+// ===============================
+// Virtual: Kiểm tra flash sale đang active
+// ===============================
 FlashSaleSchema.virtual("isCurrentlyActive").get(function() {
   const now = new Date();
   return (
@@ -191,7 +183,16 @@ FlashSaleSchema.virtual("isCurrentlyActive").get(function() {
   );
 });
 
-// ✅ Method: Cập nhật status tự động
+// ===============================
+// Virtual: Tổng số variants active
+// ===============================
+FlashSaleSchema.virtual("totalActiveVariants").get(function() {
+  return (this.variants || []).filter(v => v.isActive).length;
+});
+
+// ===============================
+// Method: Cập nhật status tự động
+// ===============================
 FlashSaleSchema.methods.updateStatus = function() {
   const now = new Date();
   
@@ -210,7 +211,70 @@ FlashSaleSchema.methods.updateStatus = function() {
   return this.status;
 };
 
-// ✅ Static: Lấy flash sale đang active
+// ===============================
+// Method: Kiểm tra variant có trong flash sale không
+// ===============================
+FlashSaleSchema.methods.hasVariant = function(variantId) {
+  return (this.variants || []).some(v => 
+    String(v.variantId) === String(variantId) && v.isActive
+  );
+};
+
+// ===============================
+// Method: Lấy thông tin variant trong flash sale
+// ===============================
+FlashSaleSchema.methods.getVariant = function(variantId) {
+  return (this.variants || []).find(v => 
+    String(v.variantId) === String(variantId) && v.isActive
+  );
+};
+
+// ===============================
+// Method: Tăng số lượng đã bán
+// ===============================
+FlashSaleSchema.methods.incrementSoldQuantity = async function(variantId, quantity = 1) {
+  const variant = this.variants.find(v => String(v.variantId) === String(variantId));
+  
+  if (!variant) {
+    throw new Error("VARIANT_NOT_IN_FLASH_SALE");
+  }
+  
+  if (!variant.isActive) {
+    throw new Error("VARIANT_NOT_ACTIVE");
+  }
+  
+  if (variant.limitedQuantity) {
+    const remaining = variant.limitedQuantity - variant.soldQuantity;
+    if (quantity > remaining) {
+      throw new Error("INSUFFICIENT_FLASH_SALE_QUANTITY");
+    }
+  }
+  
+  variant.soldQuantity += quantity;
+  await this.save();
+  
+  return variant;
+};
+
+// ===============================
+// Method: Giảm số lượng đã bán (khi hủy đơn)
+// ===============================
+FlashSaleSchema.methods.decrementSoldQuantity = async function(variantId, quantity = 1) {
+  const variant = this.variants.find(v => String(v.variantId) === String(variantId));
+  
+  if (!variant) {
+    throw new Error("VARIANT_NOT_IN_FLASH_SALE");
+  }
+  
+  variant.soldQuantity = Math.max(0, variant.soldQuantity - quantity);
+  await this.save();
+  
+  return variant;
+};
+
+// ===============================
+// Static: Lấy flash sale đang active
+// ===============================
 FlashSaleSchema.statics.getActiveSales = function(options = {}) {
   const now = new Date();
   const query = {
@@ -222,19 +286,125 @@ FlashSaleSchema.statics.getActiveSales = function(options = {}) {
   
   if (options.branchId) {
     query.$or = [
-      { branchIds: { $size: 0 } },  // Áp dụng cho tất cả
+      { branchIds: { $size: 0 } },
       { branchIds: options.branchId }
     ];
   }
   
   if (options.tierId) {
-    query.$or = [
-      { tierIds: { $size: 0 } },  // Áp dụng cho tất cả
-      { tierIds: options.tierId }
-    ];
+    const tierQuery = {
+      $or: [
+        { tierIds: { $size: 0 } },
+        { tierIds: options.tierId }
+      ]
+    };
+    
+    if (query.$or) {
+      query.$and = [
+        { $or: query.$or },
+        tierQuery
+      ];
+      delete query.$or;
+    } else {
+      query.$or = tierQuery.$or;
+    }
   }
   
   return this.find(query).sort({ priority: -1, startDate: 1 });
 };
 
+// ===============================
+// Static: Lấy flash sale có priority cao nhất cho variant
+// ===============================
+FlashSaleSchema.statics.getHighestPriorityForVariant = async function(variantId, options = {}) {
+  const now = new Date();
+  const query = {
+    isActive: true,
+    status: "ACTIVE",
+    startDate: { $lte: now },
+    endDate: { $gte: now },
+    "variants.variantId": variantId,
+    "variants.isActive": true
+  };
+  
+  if (options.branchId) {
+    query.$or = [
+      { branchIds: { $size: 0 } },
+      { branchIds: options.branchId }
+    ];
+  }
+  
+  if (options.tierId) {
+    const tierQuery = {
+      $or: [
+        { tierIds: { $size: 0 } },
+        { tierIds: options.tierId }
+      ]
+    };
+    
+    if (query.$or) {
+      query.$and = [
+        { $or: query.$or },
+        tierQuery
+      ];
+      delete query.$or;
+    } else {
+      query.$or = tierQuery.$or;
+    }
+  }
+  
+  const flashSale = await this.findOne(query).sort({ priority: -1, startDate: 1 });
+  
+  if (!flashSale) return null;
+  
+  const variant = flashSale.variants.find(v => 
+    String(v.variantId) === String(variantId) && v.isActive
+  );
+  
+  return variant ? { flashSale, variant } : null;
+};
+
+// ===============================
+// Static: Kiểm tra variant có đủ số lượng flash sale không
+// ===============================
+FlashSaleSchema.statics.checkAvailability = async function(variantId, quantity = 1, options = {}) {
+  const result = await this.getHighestPriorityForVariant(variantId, options);
+  
+  if (!result) {
+    return { available: false, reason: "NO_ACTIVE_FLASH_SALE" };
+  }
+  
+  const { variant } = result;
+  
+  if (!variant.limitedQuantity) {
+    return { available: true, flashSale: result.flashSale, variant };
+  }
+  
+  const remaining = variant.limitedQuantity - variant.soldQuantity;
+  
+  if (remaining < quantity) {
+    return { 
+      available: false, 
+      reason: "INSUFFICIENT_QUANTITY",
+      remaining 
+    };
+  }
+  
+  return { available: true, flashSale: result.flashSale, variant, remaining };
+};
+
+// ===============================
+// ✅ KHÔNG CÓ PRE-SAVE MIDDLEWARE NÀO CẢ
+// Validation và update status sẽ làm trong route handler
+// ===============================
+
+// ===============================
+// Ensure virtuals are included in JSON
+// ===============================
+FlashSaleSchema.set("toJSON", { virtuals: true });
+FlashSaleSchema.set("toObject", { virtuals: true });
+
+// ===============================
+// Export
+// ===============================
 module.exports = mongoose.model("FlashSale", FlashSaleSchema);

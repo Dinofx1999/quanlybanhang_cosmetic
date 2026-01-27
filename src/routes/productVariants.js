@@ -26,7 +26,7 @@ router.get(
   "/",
   authRequired,
   asyncHandler(async (req, res) => {
-    const productId = String(req.query.productId || "").trim();
+    const productId = String(req.query.productId || "all").trim();
     if (!productId) return res.status(400).json({ ok: false, message: "MISSING_PRODUCT_ID" });
     if (!isValidObjectId(productId)) return res.status(400).json({ ok: false, message: "INVALID_PRODUCT_ID" });
 
