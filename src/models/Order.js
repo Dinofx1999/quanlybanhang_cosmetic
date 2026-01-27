@@ -4,20 +4,15 @@ const mongoose = require("mongoose");
 // ============================
 // Order Item (Variant-ready)
 // ============================
+// src/models/Order.js
+
 const OrderItemSchema = new mongoose.Schema(
   {
-    // ✅ NEW: variantId is the "sellable unit"
     variantId: { type: mongoose.Schema.Types.ObjectId, ref: "ProductVariant", required: true },
-
-    // ✅ Keep productId for trace/reporting (optional but recommended)
     productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", default: null },
-
-    // snapshots (avoid broken display if product changes)
+    
     sku: { type: String, default: "" },
     name: { type: String, default: "" },
-
-    // optional: store attributes snapshot for receipt/reporting
-    // ex: [{k:"size", v:"100ml"}]
     attributes: {
       type: [
         {
@@ -29,8 +24,33 @@ const OrderItemSchema = new mongoose.Schema(
     },
 
     qty: { type: Number, required: true },
-    price: { type: Number, required: true }, // unit price at purchase time
-    total: { type: Number, required: true }, // price * qty (after item-level calc if you add later)
+    price: { type: Number, required: true }, // Final price (flash sale or regular)
+    total: { type: Number, required: true },
+    
+    // ✅ Flash sale metadata
+    flashSaleId: { 
+      type: mongoose.Schema.Types.ObjectId, 
+      ref: "FlashSale", 
+      default: null 
+    },
+    isFlashSale: { 
+      type: Boolean, 
+      default: false 
+    },
+    
+    // ✅ NEW: Price breakdown for display
+    originalPrice: {
+      type: Number,
+      default: null, // Original price before flash sale
+    },
+    discountPercent: {
+      type: Number,
+      default: 0, // Discount percentage (0-100)
+    },
+    discountAmount: {
+      type: Number,
+      default: 0, // Amount saved
+    },
   },
   { _id: false }
 );

@@ -594,6 +594,15 @@ router.get(
       return res.status(400).json({ ok: false, message: "INVALID_BRANCH_ID" });
     }
 
+    // ============================
+    // ✅ SALE settings
+    // ============================
+    const now = new Date();
+
+    // ⚠️ SỬA đúng tên collection sale/flashsale của bạn
+    // ví dụ: "flashsales" hoặc "flash_sale" hoặc "sales"
+    const FLASH_SALES_COLLECTION = "flashsales";
+
     // =========================================
     // MODE POS (sellables)
     // =========================================
@@ -754,6 +763,97 @@ router.get(
         // nếu defaultVariantId null -> loại bỏ khỏi list (tránh _id = null)
         { $match: { "_sellables._id": { $ne: null } } },
 
+        // =========================================
+        // ✅ SALE lookup: ưu tiên Variant sale, fallback Product sale
+        // =========================================
+
+        // 1) sale theo variantId
+        {
+          $lookup: {
+            from: FLASH_SALES_COLLECTION,
+            let: { vid: "$_sellables._id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ["$isActive", true] },
+
+                      // sale áp cho variant
+                      { $eq: ["$variantId", "$$vid"] },
+
+                      // thời gian hiệu lực (SỬA field nếu bạn dùng startAt/endAt)
+                      { $lte: ["$startsAt", now] },
+                      { $gte: ["$endsAt", now] },
+                    ],
+                  },
+                },
+              },
+              { $sort: { startsAt: -1 } },
+              { $limit: 1 },
+              {
+                $project: {
+                  _id: 1,
+                  type: 1,
+                  name: 1,
+                  startsAt: 1,
+                  endsAt: 1,
+                  discountPercent: 1,
+                  priceSale: 1,
+                },
+              },
+            ],
+            as: "_saleV",
+          },
+        },
+        { $addFields: { _saleV0: { $arrayElemAt: ["$_saleV", 0] } } },
+
+        // 2) sale theo productId
+        {
+          $lookup: {
+            from: FLASH_SALES_COLLECTION,
+            let: { pid: "$_sellables.productId" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ["$isActive", true] },
+
+                      // sale áp cho product
+                      { $eq: ["$productId", "$$pid"] },
+
+                      { $lte: ["$startsAt", now] },
+                      { $gte: ["$endsAt", now] },
+                    ],
+                  },
+                },
+              },
+              { $sort: { startsAt: -1 } },
+              { $limit: 1 },
+              {
+                $project: {
+                  _id: 1,
+                  type: 1,
+                  name: 1,
+                  startsAt: 1,
+                  endsAt: 1,
+                  discountPercent: 1,
+                  priceSale: 1,
+                },
+              },
+            ],
+            as: "_saleP",
+          },
+        },
+        { $addFields: { _saleP0: { $arrayElemAt: ["$_saleP", 0] } } },
+
+        // 3) gộp sale
+        { $addFields: { sale: { $ifNull: ["$_saleV0", "$_saleP0"] } } },
+
+        // =========================================
+        // Project output
+        // =========================================
         {
           $project: {
             _id: "$_sellables._id",
@@ -773,6 +873,10 @@ router.get(
             attributes: "$_sellables.attributes",
             isActive: "$isActive",
             stock: 1,
+
+            // ✅ trả về sale
+            sale: 1,
+
             updatedAt: "$updatedAt",
             createdAt: "$createdAt",
           },
@@ -815,13 +919,6 @@ router.get(
 
       const items = agg?.[0]?.items || [];
       const total = agg?.[0]?.total?.[0]?.count || 0;
-
-      // ✅ optional: tự heal defaultVariantId nếu có item thiếu (thường do dữ liệu cũ)
-      // (không bắt buộc; nếu bạn muốn bỏ cho nhẹ thì xoá đoạn này)
-      const missingDefault = items.some((x) => !x._id);
-      if (missingDefault) {
-        // noop
-      }
 
       return res.json({
         ok: true,
@@ -1121,6 +1218,7 @@ router.get(
     });
   })
 );
+
 
 // ===============================
 // GET /:id/variants

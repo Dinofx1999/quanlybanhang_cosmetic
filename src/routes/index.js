@@ -25,6 +25,7 @@ router.use("/variant-stocks", require("./variantStocks"));
 router.use("/product-variants", require("./productVariants"));
 router.use("/variant-stocks", require("./variantStocks"));
 router.use("/public", require("./public.routes"));
+router.use("/order-public", require("./orders.public.routes"));
 
 
 module.exports = router;

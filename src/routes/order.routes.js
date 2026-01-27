@@ -10,6 +10,7 @@ const Customer = require("../models/Customer");
 const Stock = require("../models/Stock");
 const VariantStock = require("../models/VariantStock");
 const LoyaltySetting = require("../models/LoyaltySetting");
+const FlashSale = require("../models/FlashSale"); // ✅ ADD
 
 const { authRequired, requireRole } = require("../middlewares/auth");
 const { asyncHandler } = require("../utils/asyncHandler");
@@ -68,16 +69,6 @@ function moneyInt(n) {
  * ===============================
  * ⭐ TierAgency pricing (Wholesale)
  * ===============================
- * - Customer has tierAgencyId (ObjectId TierAgency)
- * - Variant has price_tier: [{tierId, price}]
- * - Product has price_tier / baseTier / pricingRules
- * Priority:
- * 1) Variant.price_tier[tierId]
- * 2) Product.pricingRules (tier action if match)
- * 3) Product.price_tier[tierId]
- * 4) Product.baseTier[tierId]
- * 5) Variant.price (retail)
- * 6) Product.basePrice or Product.price
  */
 
 function pickTierPriceFromArray(arr, tierAgencyId) {
@@ -140,16 +131,13 @@ async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache 
   const tid = String(tierAgencyId || "").trim();
   const hasTier = !!tid && mongoose.isValidObjectId(tid);
 
-  // Base retail from variant
   let retail = moneyInt(variant?.price || 0);
 
-  // 1) Variant.price_tier
   if (hasTier) {
     const vTier = pickTierPriceFromArray(variant?.price_tier, tid);
     if (vTier != null) return moneyInt(vTier);
   }
 
-  // Fetch product (cached)
   let prod = null;
   const pid = variant?.productId ? String(variant.productId) : "";
   if (pid && mongoose.isValidObjectId(pid)) {
@@ -162,10 +150,8 @@ async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache 
     }
   }
 
-  // If variant retail missing, fallback from product
   if (!retail && prod) retail = moneyInt(prod.basePrice ?? prod.price ?? 0);
 
-  // 2) Product.pricingRules
   if (prod && Array.isArray(prod.pricingRules) && prod.pricingRules.length) {
     const rules = [...prod.pricingRules].sort(
       (a, b) => Number(a?.priority || 100) - Number(b?.priority || 100)
@@ -174,7 +160,6 @@ async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache 
     let curRetail = retail;
     let curTier = null;
 
-    // base tier from product (price_tier > baseTier)
     if (hasTier) {
       const pTier = pickTierPriceFromArray(prod.price_tier, tid);
       const bTier = pickTierPriceFromArray(prod.baseTier, tid);
@@ -199,22 +184,18 @@ async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache 
     return moneyInt(curRetail);
   }
 
-  // 3) Product.price_tier
   if (hasTier && prod) {
     const pTier = pickTierPriceFromArray(prod.price_tier, tid);
     if (pTier != null) return moneyInt(pTier);
   }
 
-  // 4) Product.baseTier
   if (hasTier && prod) {
     const bTier = pickTierPriceFromArray(prod.baseTier, tid);
     if (bTier != null) return moneyInt(bTier);
   }
 
-  // 5) Variant retail
   if (retail) return moneyInt(retail);
 
-  // 6) Product fallback
   if (prod) return moneyInt(prod.basePrice ?? prod.price ?? 0);
 
   return 0;
@@ -222,10 +203,8 @@ async function resolveSellPriceForVariant({ variant, tierAgencyId, productCache 
 
 /**
  * ===============================
- * ⭐ Items builder - VARIANT-BASED
+ * ⭐ Items builder - VARIANT-BASED + FLASH SALE
  * ===============================
- * Accept: [{ productId: "variantId", qty: 1 }]
- * Server auto-detects if it's a variant
  */
 async function buildOrderItems(itemsIn, opts = {}) {
   const items = [];
@@ -259,7 +238,7 @@ async function buildOrderItems(itemsIn, opts = {}) {
 
     // ⭐ Find variant (sellable unit)
     const variant = await ProductVariant.findById(variantId)
-      .select("_id productId sku name price price_tier attributes isActive")
+      .select("_id productId sku name price price_tier attributes isActive activeFlashSaleId flashSalePrice flashSaleEndDate")
       .lean();
 
     if (!variant || !variant.isActive) {
@@ -269,17 +248,214 @@ async function buildOrderItems(itemsIn, opts = {}) {
       throw err;
     }
 
-    const price = await resolveSellPriceForVariant({ variant, tierAgencyId, productCache });
+    let price = 0;
+    let flashSaleId = null;
+    let isFlashSale = false;
+
+    // ✅ CHECK FLASH SALE FIRST (highest priority)
+    const now = new Date();
+    
+    if (
+      variant.activeFlashSaleId && 
+      variant.flashSalePrice && 
+      variant.flashSaleEndDate && 
+      new Date(variant.flashSaleEndDate) >= now
+    ) {
+      // Variant has active flash sale
+      const flashSale = await FlashSale.findById(variant.activeFlashSaleId);
+      
+      if (flashSale && flashSale.isActive && flashSale.status === "ACTIVE") {
+        const fsVariant = flashSale.variants.find(
+          v => String(v.variantId) === String(variantId) && v.isActive
+        );
+
+        if (fsVariant) {
+          // ✅ Check flash sale stock availability
+          if (fsVariant.limitedQuantity !== null) {
+            const remaining = fsVariant.limitedQuantity - fsVariant.soldQuantity;
+            
+            if (remaining < qty) {
+              const err = new Error("FLASH_SALE_OUT_OF_STOCK");
+              err.code = "FLASH_SALE_OUT_OF_STOCK";
+              err.detail = `Flash sale chỉ còn ${remaining} sản phẩm, bạn đang đặt ${qty}`;
+              err.remaining = remaining;
+              throw err;
+            }
+          }
+
+          // ✅ Check maxPerCustomer (optional - can implement later)
+          if (fsVariant.maxPerCustomer && qty > fsVariant.maxPerCustomer) {
+            const err = new Error("FLASH_SALE_MAX_PER_CUSTOMER_EXCEEDED");
+            err.code = "FLASH_SALE_MAX_PER_CUSTOMER_EXCEEDED";
+            err.detail = `Chỉ được mua tối đa ${fsVariant.maxPerCustomer} sản phẩm`;
+            err.maxPerCustomer = fsVariant.maxPerCustomer;
+            throw err;
+          }
+
+          // ✅ Use flash sale price
+          price = Number(fsVariant.flashPrice || 0);
+          flashSaleId = flashSale._id;
+          isFlashSale = true;
+        }
+      }
+    }
+
+    // If no flash sale, use tier/retail price
+    if (!isFlashSale) {
+      price = await resolveSellPriceForVariant({ variant, tierAgencyId, productCache });
+    }
 
     items.push({
       variantId: variant._id,
-      productId: variant.productId, // parent product for reporting
+      productId: variant.productId,
       sku: variant.sku || "",
       name: variant.name || "",
       attributes: variant.attributes || [],
       qty,
       price,
       total: qty * price,
+      
+      // ✅ Flash sale metadata
+      flashSaleId: flashSaleId || null,
+      isFlashSale,
+    });
+  }
+
+  return items;
+}// src/routes/orders.routes.js
+
+async function buildOrderItems(itemsIn, opts = {}) {
+  const items = [];
+  const tierAgencyId = String(opts?.tierAgencyId || "").trim();
+  const productCache = opts?.productCache || new Map();
+
+  for (const item of itemsIn) {
+    const productId = item.productId || item.itemId;
+    const qty = Number(item.qty || 0);
+
+    if (!productId) {
+      const err = new Error("MISSING_PRODUCT_ID");
+      err.code = "MISSING_PRODUCT_ID";
+      throw err;
+    }
+
+    if (!mongoose.isValidObjectId(productId)) {
+      const err = new Error("INVALID_PRODUCT_ID");
+      err.code = "INVALID_PRODUCT_ID";
+      err.detail = `productId=${productId}`;
+      throw err;
+    }
+
+    if (qty <= 0) {
+      const err = new Error("INVALID_QTY");
+      err.code = "INVALID_QTY";
+      throw err;
+    }
+
+    const variantId = new mongoose.Types.ObjectId(productId);
+
+    // Find variant
+    const variant = await ProductVariant.findById(variantId)
+      .select("_id productId sku name price price_tier attributes isActive activeFlashSaleId flashSalePrice flashSaleEndDate")
+      .lean();
+
+    if (!variant || !variant.isActive) {
+      const err = new Error("VARIANT_NOT_FOUND");
+      err.code = "VARIANT_NOT_FOUND";
+      err.detail = `variantId=${productId} not found or inactive`;
+      throw err;
+    }
+
+    let price = 0;
+    let flashSaleId = null;
+    let isFlashSale = false;
+    let originalPrice = 0;
+    let discountPercent = 0;
+    let discountAmount = 0;
+
+    // ✅ CHECK FLASH SALE FIRST (highest priority)
+    const now = new Date();
+    
+    if (
+      variant.activeFlashSaleId && 
+      variant.flashSalePrice && 
+      variant.flashSaleEndDate && 
+      new Date(variant.flashSaleEndDate) >= now
+    ) {
+      const flashSale = await FlashSale.findById(variant.activeFlashSaleId);
+      
+      if (flashSale && flashSale.isActive && flashSale.status === "ACTIVE") {
+        const fsVariant = flashSale.variants.find(
+          v => String(v.variantId) === String(variantId) && v.isActive
+        );
+
+        if (fsVariant) {
+          // Check stock availability
+          if (fsVariant.limitedQuantity !== null) {
+            const remaining = fsVariant.limitedQuantity - fsVariant.soldQuantity;
+            
+            if (remaining < qty) {
+              const err = new Error("FLASH_SALE_OUT_OF_STOCK");
+              err.code = "FLASH_SALE_OUT_OF_STOCK";
+              err.detail = `Flash sale chỉ còn ${remaining} sản phẩm, bạn đang đặt ${qty}`;
+              err.remaining = remaining;
+              throw err;
+            }
+          }
+
+          // Check maxPerCustomer
+          if (fsVariant.maxPerCustomer && qty > fsVariant.maxPerCustomer) {
+            const err = new Error("FLASH_SALE_MAX_PER_CUSTOMER_EXCEEDED");
+            err.code = "FLASH_SALE_MAX_PER_CUSTOMER_EXCEEDED";
+            err.detail = `Chỉ được mua tối đa ${fsVariant.maxPerCustomer} sản phẩm`;
+            err.maxPerCustomer = fsVariant.maxPerCustomer;
+            throw err;
+          }
+
+          // ✅ Calculate original price (before flash sale)
+          originalPrice = await resolveSellPriceForVariant({ variant, tierAgencyId, productCache });
+          
+          // ✅ Use flash sale price
+          price = Number(fsVariant.flashPrice || 0);
+          
+          // ✅ Calculate discount
+          discountAmount = Math.max(0, originalPrice - price);
+          discountPercent = originalPrice > 0 
+            ? Math.round((discountAmount / originalPrice) * 100) 
+            : 0;
+          
+          flashSaleId = flashSale._id;
+          isFlashSale = true;
+        }
+      }
+    }
+
+    // If no flash sale, use tier/retail price
+    if (!isFlashSale) {
+      price = await resolveSellPriceForVariant({ variant, tierAgencyId, productCache });
+      originalPrice = price; // Same as final price
+      discountPercent = 0;
+      discountAmount = 0;
+    }
+
+    items.push({
+      variantId: variant._id,
+      productId: variant.productId,
+      sku: variant.sku || "",
+      name: variant.name || "",
+      attributes: variant.attributes || [],
+      qty,
+      price,
+      total: qty * price,
+      
+      // ✅ Flash sale metadata
+      flashSaleId: flashSaleId || null,
+      isFlashSale,
+      
+      // ✅ Price breakdown for display
+      originalPrice,
+      discountPercent,
+      discountAmount,
     });
   }
 
@@ -301,7 +477,7 @@ async function allocatePosStockSingleBranch({ branchId, items }) {
     allocations.push({
       branchId,
       variantId: it.variantId,
-      productId: it.productId, // optional for reporting
+      productId: it.productId,
       qty,
     });
   }
@@ -343,12 +519,99 @@ async function applyStockDelta(allocations, sign /* -1 subtract, +1 restore */) 
     const qty = Number(al.qty || 0) * Number(sign || 0);
     if (!al.branchId || !al.variantId || !qty) continue;
 
-    // ⭐ Update variant stock
     await VariantStock.findOneAndUpdate(
       { branchId: al.branchId, variantId: al.variantId },
       { $inc: { qty } },
       { upsert: true, new: true }
     );
+  }
+}
+
+/**
+ * ===============================
+ * ✅ FLASH SALE HELPERS
+ * ===============================
+ */
+
+/**
+ * Increment sold quantity for flash sale items
+ */
+async function incrementFlashSaleSoldQuantities(items) {
+  for (const item of items) {
+    if (!item.flashSaleId || !item.isFlashSale) continue;
+
+    try {
+      const flashSale = await FlashSale.findById(item.flashSaleId);
+      if (!flashSale) continue;
+
+      await flashSale.incrementSoldQuantity(item.variantId, item.qty);
+      
+      console.log(`✅ Flash sale ${flashSale.code}: Incremented ${item.qty} for variant ${item.variantId}`);
+    } catch (error) {
+      console.error(`❌ Error incrementing flash sale sold quantity:`, error);
+      // Don't throw - order already created
+    }
+  }
+}
+
+/**
+ * Decrement sold quantity for flash sale items (on cancel/refund)
+ */
+async function decrementFlashSaleSoldQuantities(items) {
+  for (const item of items) {
+    if (!item.flashSaleId || !item.isFlashSale) continue;
+
+    try {
+      const flashSale = await FlashSale.findById(item.flashSaleId);
+      if (!flashSale) continue;
+
+      await flashSale.decrementSoldQuantity(item.variantId, item.qty);
+      
+      console.log(`✅ Flash sale ${flashSale.code}: Decremented ${item.qty} for variant ${item.variantId}`);
+    } catch (error) {
+      console.error(`❌ Error decrementing flash sale sold quantity:`, error);
+      // Don't throw - order cancellation should proceed
+    }
+  }
+}
+
+/**
+ * Re-check flash sale availability before confirming order
+ */
+async function recheckFlashSaleAvailability(items) {
+  for (const item of items) {
+    if (!item.flashSaleId || !item.isFlashSale) continue;
+
+    const flashSale = await FlashSale.findById(item.flashSaleId);
+    if (!flashSale) {
+      const err = new Error("FLASH_SALE_NO_LONGER_AVAILABLE");
+      err.code = "FLASH_SALE_NO_LONGER_AVAILABLE";
+      err.detail = `Flash sale cho sản phẩm ${item.name} đã kết thúc`;
+      throw err;
+    }
+
+    const fsVariant = flashSale.variants.find(
+      v => String(v.variantId) === String(item.variantId) && v.isActive
+    );
+
+    if (!fsVariant) {
+      const err = new Error("FLASH_SALE_VARIANT_NO_LONGER_AVAILABLE");
+      err.code = "FLASH_SALE_VARIANT_NO_LONGER_AVAILABLE";
+      err.detail = `Sản phẩm ${item.name} không còn trong flash sale`;
+      throw err;
+    }
+
+    if (fsVariant.limitedQuantity !== null) {
+      const remaining = fsVariant.limitedQuantity - fsVariant.soldQuantity;
+      
+      if (remaining < item.qty) {
+        const err = new Error("FLASH_SALE_OUT_OF_STOCK");
+        err.code = "FLASH_SALE_OUT_OF_STOCK";
+        err.detail = `Flash sale chỉ còn ${remaining} sản phẩm ${item.name}`;
+        err.remaining = remaining;
+        throw err;
+      }
+    }
   }
 }
 
@@ -535,12 +798,11 @@ router.post(
 
         branchId: z.string().optional(),
 
-        // ✅ NEW: FE can send customerId only
         customerId: z.string().optional(),
 
         customer: z
           .object({
-            _id: z.string().optional(), // ✅ allow FE send customer._id too
+            _id: z.string().optional(),
             phone: z.string().optional(),
             name: z.string().optional(),
             email: z.string().optional(),
@@ -625,9 +887,7 @@ router.post(
       if (!receiverPhone) return res.status(400).json({ ok: false, message: "SHIP requires customer.phone" });
     }
 
-    // =========================
-    // ✅ Customer resolution
-    // =========================
+    // Customer resolution
     let customerId = null;
     let customerDoc = null;
     let tierAgencyId = "";
@@ -643,7 +903,6 @@ router.post(
       customerId = customerDoc._id;
       tierAgencyId = String(customerDoc?.tierAgencyId || "").trim();
 
-      // Optional: update basic info if FE sends them
       const setObj = {};
       if (data.customer?.name != null) setObj.name = data.customer.name || "";
       if (data.customer?.email != null) setObj.email = data.customer.email || "";
@@ -661,7 +920,6 @@ router.post(
       }
     }
 
-    // Fallback old behavior by phone if no customerId
     if (!customerId && data.customer?.phone) {
       const setObj = {
         name: data.customer.name || "",
@@ -683,7 +941,7 @@ router.post(
       tierAgencyId = String(customerDoc?.tierAgencyId || "").trim();
     }
 
-    // ✅ Build items with server-truth pricing (retail or wholesale)
+    // ✅ Build items with flash sale checking
     const productCache = new Map();
     const items = await buildOrderItems(data.items, { tierAgencyId, productCache });
     const subtotal = moneyInt(items.reduce((s, it) => s + Number(it.total || 0), 0));
@@ -839,6 +1097,11 @@ router.post(
 
       await order.save();
 
+      // ✅ INCREMENT FLASH SALE SOLD QUANTITY
+      if (requestedStatus === "CONFIRM") {
+        await incrementFlashSaleSoldQuantities(order.items);
+      }
+
       if (requestedStatus === "CONFIRM" && order.customerId && order.pointsRedeemed > 0 && !order.pointsRedeemedAt) {
         await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: -order.pointsRedeemed } });
         order.pointsRedeemedAt = new Date();
@@ -863,8 +1126,6 @@ router.post(
  * ===============================
  * POST /api/orders/:id/confirm
  * ===============================
- * ✅ IMPORTANT:
- * - Nếu order PENDING được tạo trước đó, ta rebuild lại items/subtotal/total theo tierAgencyId (POS) trước khi validate payments
  */
 router.post(
   "/:id/confirm",
@@ -916,13 +1177,15 @@ router.post(
       return res.status(409).json({ ok: false, message: `Only PENDING can be confirmed. Current=${order.status}` });
     }
 
+    // ✅ RE-CHECK FLASH SALE AVAILABILITY (in case stock changed)
+    await recheckFlashSaleAvailability(order.items);
+
     // ✅ Rebuild POS pricing server-truth by customer's tierAgencyId (if any)
     if (String(order.channel) === "POS" && order.customerId) {
       const customer = await Customer.findById(order.customerId).lean();
       const tierAgencyId = String(customer?.tierAgencyId || "").trim();
 
       if (tierAgencyId && mongoose.isValidObjectId(tierAgencyId)) {
-        // rebuild items by variantId + qty
         const itemsIn = (order.items || []).map((it) => ({
           productId: String(it.variantId || it.productId || ""),
           qty: Number(it.qty || 0),
@@ -934,8 +1197,6 @@ router.post(
         const newSubtotal = moneyInt(rebuilt.reduce((s, it) => s + Number(it.total || 0), 0));
         order.items = rebuilt;
         order.subtotal = newSubtotal;
-
-        // note: total will be recalculated below (redeem part) as well
       }
     }
 
@@ -950,7 +1211,6 @@ router.post(
 
     const finalPayments = order.payments && order.payments.length ? normalizePayments(order.payments) : incoming;
 
-    // base total from current order (maybe rebuilt)
     let totalAmount = moneyInt(order.total || 0);
 
     if (String(order.channel) === "POS") {
@@ -1001,22 +1261,25 @@ router.post(
     }
 
     if (String(order.channel) === "ONLINE") {
-      if (!finalPayments.length) {
-        order.payments = [{ method: "COD", amount: totalAmount }];
-      } else {
-        const sumPaid = moneyInt(sumPayments(finalPayments));
-        if (finalPayments.some((p) => p.method === "CASH")) {
-          return res.status(400).json({ ok: false, message: "ONLINE không dùng CASH" });
-        }
-        if (finalPayments.some((p) => p.method === "COD")) {
-          return res.status(400).json({ ok: false, message: "ONLINE COD sẽ auto khi CONFIRM" });
-        }
-        if (sumPaid !== totalAmount) {
-          return res.status(400).json({ ok: false, message: `ONLINE prepay requires sum(payments)==order.total (${totalAmount})` });
-        }
-        order.payments = finalPayments;
-      }
-    } else {
+  // ✅ Nếu FE lỡ gửi COD thì bỏ qua, vì COD sẽ auto
+  const cleaned = (finalPayments || []).filter((p) => p.method !== "COD");
+
+  if (!cleaned.length) {
+    order.payments = [{ method: "COD", amount: totalAmount }];
+  } else {
+    const sumPaid = moneyInt(sumPayments(cleaned));
+    if (cleaned.some((p) => p.method === "CASH")) {
+      return res.status(400).json({ ok: false, message: "ONLINE không dùng CASH" });
+    }
+    if (sumPaid !== totalAmount) {
+      return res.status(400).json({
+        ok: false,
+        message: `ONLINE prepay requires sum(payments)==order.total (${totalAmount})`,
+      });
+    }
+    order.payments = cleaned;
+  }
+} else {
       if (finalPayments.some((p) => p.method === "COD")) {
         return res.status(400).json({ ok: false, message: "POS không dùng COD" });
       }
@@ -1059,6 +1322,9 @@ router.post(
     order.confirmedById = req.user.sub || null;
 
     await order.save();
+
+    // ✅ INCREMENT FLASH SALE SOLD QUANTITY
+    await incrementFlashSaleSoldQuantities(order.items);
 
     if (order.customerId && order.pointsRedeemed > 0 && !order.pointsRedeemedAt) {
       await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: -order.pointsRedeemed } });
@@ -1246,6 +1512,9 @@ router.patch(
         await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: +ptsRedeemed } });
         order.pointsRedeemRevertedAt = new Date();
       }
+
+      // ✅ DECREMENT FLASH SALE SOLD QUANTITY
+      await decrementFlashSaleSoldQuantities(order.items);
     }
 
     if (next === "SHIPPED") {
@@ -1267,6 +1536,9 @@ router.patch(
         await Customer.findByIdAndUpdate(order.customerId, { $inc: { points: +ptsRedeemed } });
         order.pointsRedeemRevertedAt = new Date();
       }
+
+      // ✅ DECREMENT FLASH SALE SOLD QUANTITY
+      await decrementFlashSaleSoldQuantities(order.items);
     }
 
     order.status = next;
