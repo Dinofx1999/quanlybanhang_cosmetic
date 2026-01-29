@@ -134,4 +134,57 @@ router.post(
   }
 );
 
+// =====================
+// FLASH SALE BANNER (THÊM MỚI)
+// =====================
+const FLASHSALE_UPLOAD_DIR = path.join(process.cwd(), "uploads", "flashsale");
+fs.mkdirSync(FLASHSALE_UPLOAD_DIR, { recursive: true });
+
+const flashSaleStorage = multer.diskStorage({
+  destination: function (_req, _file, cb) {
+    cb(null, FLASHSALE_UPLOAD_DIR);
+  },
+  filename: function (_req, file, cb) {
+    const fname = genFileName(file.originalname);
+    if (!fname) return cb(new Error("INVALID_FILE_TYPE"));
+    cb(null, fname);
+  },
+});
+
+const uploadFlashSale = multer({
+  storage: flashSaleStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // banner có thể lớn hơn
+  fileFilter: (_req, file, cb) => {
+    const ext = safeExt(file.originalname);
+    if (!ext) return cb(new Error("INVALID_FILE_TYPE"));
+    cb(null, true);
+  },
+});
+
+function buildFlashSaleFileUrl(req, filename) {
+  const base = `${req.protocol}://${req.get("host")}`;
+  return `${base}/uploads/flashsale/${filename}`;
+}
+
+// Upload banner Flash Sale (1 ảnh)
+router.post(
+  "/flashsale-banner",
+  // authRequired,
+  uploadFlashSale.single("file"),
+  (req, res) => {
+    if (!req.file) return res.status(400).json({ ok: false, message: "Missing file" });
+
+    const url = buildFlashSaleFileUrl(req, req.file.filename);
+    res.json({
+      ok: true,
+      file: {
+        filename: req.file.filename,
+        url, // ✅ FE lấy url này set vào flashsale.banner
+        size: req.file.size,
+        mimetype: req.file.mimetype,
+      },
+    });
+  }
+);
+
 module.exports = router;

@@ -8,6 +8,8 @@ const Customer = require("../models/Customer");
 const ProductVariant = require("../models/ProductVariant");
 const FlashSale = require("../models/FlashSale");
 
+const Product = require("../models/Product");
+
 const { asyncHandler } = require("../utils/asyncHandler");
 const { genOrderCode } = require("../utils/code");
 
@@ -19,7 +21,7 @@ function moneyInt(n) {
 
 /**
  * ===============================
- * POST /api/public/orders - Create ONLINE order (no auth)
+ * POST /api/order-public/orders - Create ONLINE order (no auth)
  * ===============================
  */
 router.post(
@@ -49,11 +51,11 @@ router.post(
           amount: z.number().nonnegative().default(0),
         }),
 
-        // Items
+        // Items (FE đang gửi productId nhưng thực tế có lúc là variantId)
         items: z
           .array(
             z.object({
-              productId: z.string(), // Actually variantId
+              productId: z.string(),
               qty: z.number().int().positive(),
             })
           )
@@ -75,69 +77,122 @@ router.post(
 
     const data = body.data;
 
-    // ✅ Validate all variantIds exist
-    const variantIds = data.items.map((it) => it.productId);
-    const invalidIds = variantIds.filter((id) => !mongoose.isValidObjectId(id));
+    // ============================================================
+    // ✅ RESOLVE VARIANTS:
+    //    - If id matches ProductVariant._id => use it
+    //    - Else treat id as Product._id and pick default variant
+    // ============================================================
 
+    const rawIds = data.items.map((it) => String(it.productId || "").trim());
+    const uniqueIds = [...new Set(rawIds)];
+
+    // Validate objectId format
+    const invalidIds = uniqueIds.filter((id) => !mongoose.isValidObjectId(id));
     if (invalidIds.length) {
       return res.status(400).json({
         ok: false,
         message: "ID sản phẩm không hợp lệ",
+        invalidIds,
       });
     }
 
-    const variants = await ProductVariant.find({
-      _id: { $in: variantIds },
+    // 1) Try fetch by variantId
+    let variants = await ProductVariant.find({
+      _id: { $in: uniqueIds },
       isActive: true,
     })
-      .select("_id productId sku name price attributes activeFlashSaleId flashSalePrice flashSaleEndDate")
+      .select(
+        "_id productId sku name price attributes isDefault activeFlashSaleId flashSalePrice flashSaleStartDate flashSaleEndDate"
+      )
       .lean();
 
-    if (variants.length !== variantIds.length) {
+    // 2) Missing as variantId => fallback treat as productId -> pick default variant
+    const foundAsVariantId = new Set(variants.map((v) => String(v._id)));
+    const missingAsVariant = uniqueIds.filter((id) => !foundAsVariantId.has(id));
+
+    if (missingAsVariant.length) {
+      const fallback = await ProductVariant.find({
+        productId: { $in: missingAsVariant },
+        isActive: true,
+      })
+        .sort({ isDefault: -1, createdAt: 1 }) // ưu tiên default
+        .select(
+          "_id productId sku name price attributes isDefault activeFlashSaleId flashSalePrice flashSaleStartDate flashSaleEndDate"
+        )
+        .lean();
+
+      // pick one per productId
+      const bestByProductId = new Map();
+      for (const v of fallback) {
+        const pid = String(v.productId);
+        if (!bestByProductId.has(pid)) bestByProductId.set(pid, v);
+      }
+
+      variants = variants.concat([...bestByProductId.values()]);
+    }
+
+    // 3) Final missing check: resolved if matches either variant._id OR variant.productId
+    const resolved = new Set();
+    for (const v of variants) {
+      resolved.add(String(v._id));
+      resolved.add(String(v.productId));
+    }
+
+    const stillMissing = uniqueIds.filter((id) => !resolved.has(id));
+    if (stillMissing.length) {
       return res.status(400).json({
         ok: false,
         message: "Một số sản phẩm không tồn tại hoặc đã ngừng bán",
+        missingIds: stillMissing,
       });
     }
 
+    // ============================================================
     // ✅ Build order items with flash sale checking
+    // ============================================================
+
     const items = [];
     let subtotal = 0;
 
     for (const reqItem of data.items) {
-      const variant = variants.find((v) => String(v._id) === reqItem.productId);
+      const reqId = String(reqItem.productId || "").trim();
+
+      // match both ways: user sent variantId OR productId
+      const variant = variants.find(
+        (v) => String(v._id) === reqId || String(v.productId) === reqId
+      );
 
       if (!variant) continue;
 
       const qty = Math.max(1, Number(reqItem.qty));
       let price = Number(variant.price || 0);
+
       let flashSaleId = null;
       let isFlashSale = false;
-      let originalPrice = Number(variant.price || 0); // ✅ Default to variant price
+
+      let originalPrice = Number(variant.price || 0); // regular
       let discountPercent = 0;
       let discountAmount = 0;
 
-      // ✅ Check if variant has active flash sale
       const now = new Date();
 
+      // ✅ Check if variant has active flash sale
       if (
         variant.activeFlashSaleId &&
-        variant.flashSalePrice &&
         variant.flashSaleEndDate &&
         new Date(variant.flashSaleEndDate) >= now
       ) {
-        const flashSale = await FlashSale.findById(variant.activeFlashSaleId);
+        const flashSale = await FlashSale.findById(variant.activeFlashSaleId).lean();
 
         if (flashSale && flashSale.isActive && flashSale.status === "ACTIVE") {
-          const fsVariant = flashSale.variants.find(
+          const fsVariant = (flashSale.variants || []).find(
             (v) => String(v.variantId) === String(variant._id) && v.isActive
           );
 
           if (fsVariant) {
             // ✅ Check stock availability
-            if (fsVariant.limitedQuantity !== null) {
-              const remaining = fsVariant.limitedQuantity - fsVariant.soldQuantity;
-
+            if (fsVariant.limitedQuantity !== null && fsVariant.limitedQuantity !== undefined) {
+              const remaining = Number(fsVariant.limitedQuantity) - Number(fsVariant.soldQuantity || 0);
               if (remaining < qty) {
                 return res.status(400).json({
                   ok: false,
@@ -149,7 +204,7 @@ router.post(
             }
 
             // ✅ Check maxPerCustomer
-            if (fsVariant.maxPerCustomer && qty > fsVariant.maxPerCustomer) {
+            if (fsVariant.maxPerCustomer && qty > Number(fsVariant.maxPerCustomer)) {
               return res.status(400).json({
                 ok: false,
                 message: `Chỉ được mua tối đa ${fsVariant.maxPerCustomer} sản phẩm "${variant.name}"`,
@@ -158,14 +213,13 @@ router.post(
               });
             }
 
-            // ✅ Calculate price breakdown
-            originalPrice = Number(variant.price || 0); // Regular price
-            price = Number(fsVariant.flashPrice || 0); // Flash sale price
+            // ✅ Use flash price
+            originalPrice = Number(variant.price || 0);
+            price = Number(fsVariant.flashPrice || variant.flashSalePrice || 0);
+
             discountAmount = Math.max(0, originalPrice - price);
-            discountPercent = originalPrice > 0 
-              ? Math.round((discountAmount / originalPrice) * 100) 
-              : 0;
-            
+            discountPercent = originalPrice > 0 ? Math.round((discountAmount / originalPrice) * 100) : 0;
+
             flashSaleId = flashSale._id;
             isFlashSale = true;
           }
@@ -177,18 +231,20 @@ router.post(
       items.push({
         variantId: variant._id,
         productId: variant.productId,
+
         sku: variant.sku || "",
         name: variant.name || "",
         attributes: variant.attributes || [],
+
         qty,
         price,
         total: itemTotal,
-        
-        // ✅ Flash sale metadata
+
+        // flash meta
         flashSaleId,
         isFlashSale,
-        
-        // ✅ Price breakdown for display
+
+        // breakdown
         originalPrice,
         discountPercent,
         discountAmount,
@@ -204,10 +260,11 @@ router.post(
       });
     }
 
+    // ============================================================
     // ✅ Find or create customer
-    let customer = await Customer.findOne({
-      phone: data.customer.phone,
-    });
+    // ============================================================
+
+    let customer = await Customer.findOne({ phone: data.customer.phone });
 
     if (!customer) {
       customer = await Customer.create({
@@ -216,7 +273,6 @@ router.post(
         email: data.customer.email || "",
       });
     } else {
-      // Update name/email if provided
       const updates = {};
       if (data.customer.name) updates.name = data.customer.name;
       if (data.customer.email) updates.email = data.customer.email;
@@ -226,26 +282,29 @@ router.post(
       }
     }
 
-    // ✅ Calculate totals
+    // ============================================================
+    // ✅ Totals
+    // ============================================================
+
     const discount = Math.max(0, Number(data.discount || 0));
     const extraFee = Math.max(0, Number(data.extraFee || 0));
     const total = Math.max(0, subtotal - discount + extraFee);
 
-    // ✅ Calculate total savings from flash sales
     const totalSavings = items.reduce((sum, it) => {
-      if (it.isFlashSale) {
-        return sum + (it.discountAmount * it.qty);
-      }
+      if (it.isFlashSale) return sum + it.discountAmount * it.qty;
       return sum;
     }, 0);
 
+    // ============================================================
     // ✅ Create order
+    // ============================================================
+
     const order = await Order.create({
-      code: genOrderCode("WEB"), // or "ONLINE"
+      code: genOrderCode("WEB"),
       channel: "ONLINE",
       status: "PENDING",
 
-      branchId: null, // Will be allocated when confirmed
+      branchId: null,
       customerId: customer._id,
 
       subtotal,
@@ -253,12 +312,9 @@ router.post(
       extraFee,
       total,
 
-      items, // ✅ Items with flash sale info and price breakdown
+      items,
 
-      payments:
-        data.payment.method === "COD"
-          ? [{ method: "COD", amount: 0 }]
-          : [],
+      payments: data.payment.method === "COD" ? [{ method: "COD", amount: 0 }] : [],
 
       delivery: {
         method: "SHIP",
@@ -269,11 +325,13 @@ router.post(
       },
 
       stockAllocations: [],
-
-      createdById: null, // Public order, no user
+      createdById: null,
     });
 
-    // ✅ Return success with detailed info
+    // ============================================================
+    // ✅ Response
+    // ============================================================
+
     res.status(201).json({
       ok: true,
       message: "Đặt hàng thành công",
@@ -282,19 +340,16 @@ router.post(
         code: order.code,
         status: order.status,
         channel: order.channel,
-        
-        // ✅ Price breakdown
+
         subtotal: order.subtotal,
         discount: order.discount,
         extraFee: order.extraFee,
         total: order.total,
-        
-        // ✅ Flash sale info
+
         hasFlashSaleItems: items.some((it) => it.isFlashSale),
-        totalSavings, // Total amount saved from flash sales
-        
-        // ✅ Items with full details
-        items: items.map(it => ({
+        totalSavings,
+
+        items: items.map((it) => ({
           variantId: it.variantId,
           productId: it.productId,
           sku: it.sku,
@@ -307,15 +362,13 @@ router.post(
           total: it.total,
           isFlashSale: it.isFlashSale,
         })),
-        
-        // ✅ Customer info
+
         customer: {
           name: data.customer.name,
           phone: data.customer.phone,
           email: data.customer.email || "",
         },
-        
-        // ✅ Delivery info
+
         delivery: {
           method: order.delivery.method,
           address: order.delivery.address,
@@ -323,28 +376,25 @@ router.post(
           receiverPhone: order.delivery.receiverPhone,
           note: order.delivery.note,
         },
-        
+
         createdAt: order.createdAt,
       },
     });
   })
 );
 
+
 /**
  * ===============================
- * GET /api/public/orders/:code - Get order by code (no auth)
+ * GET /api/order-public/orders/:code - Get order by code (no auth)
  * ===============================
  */
 router.get(
   "/orders/:code",
   asyncHandler(async (req, res) => {
     const code = String(req.params.code || "").trim().toUpperCase();
-    
     if (!code) {
-      return res.status(400).json({
-        ok: false,
-        message: "Mã đơn hàng không hợp lệ",
-      });
+      return res.status(400).json({ ok: false, message: "Mã đơn hàng không hợp lệ" });
     }
 
     const order = await Order.findOne({ code })
@@ -352,19 +402,65 @@ router.get(
       .lean();
 
     if (!order) {
-      return res.status(404).json({
-        ok: false,
-        message: "Không tìm thấy đơn hàng",
-      });
+      return res.status(404).json({ ok: false, message: "Không tìm thấy đơn hàng" });
     }
 
-    // ✅ Calculate savings
+    // ✅ savings
     const totalSavings = (order.items || []).reduce((sum, it) => {
-      if (it.isFlashSale && it.discountAmount) {
-        return sum + (it.discountAmount * it.qty);
-      }
+      if (it.isFlashSale && it.discountAmount) return sum + it.discountAmount * it.qty;
       return sum;
     }, 0);
+
+    // =========================
+    // ✅ ADD IMAGE TO ITEMS
+    // =========================
+    const items = order.items || [];
+
+    const productIds = Array.from(
+      new Set(items.map((it) => String(it.productId || "")).filter(Boolean))
+    );
+
+    const variantIds = Array.from(
+      new Set(items.map((it) => String(it.variantId || "")).filter(Boolean))
+    );
+
+    // Query products + variants (only fields needed)
+    const [products, variants] = await Promise.all([
+      productIds.length
+        ? Product.find({ _id: { $in: productIds } })
+            .select("_id thumbnail images")
+            .lean()
+        : [],
+      variantIds.length
+        ? ProductVariant.find({ _id: { $in: variantIds } })
+            .select("_id thumbnail images")
+            .lean()
+        : [],
+    ]);
+
+    const productMap = new Map(
+      products.map((p) => [
+        String(p._id),
+        p.thumbnail || p.images?.find((x) => x?.isPrimary)?.url || p.images?.[0]?.url || null,
+      ])
+    );
+
+    const variantMap = new Map(
+      variants.map((v) => [
+        String(v._id),
+        v.thumbnail || v.images?.find((x) => x?.isPrimary)?.url || v.images?.[0]?.url || null,
+      ])
+    );
+
+    const itemsWithImage = items.map((it) => {
+      const vid = String(it.variantId || "");
+      const pid = String(it.productId || "");
+      const image = (vid && variantMap.get(vid)) || (pid && productMap.get(pid)) || null;
+
+      return { ...it, image };
+    });
+
+    // =========================
 
     res.json({
       ok: true,
@@ -373,21 +469,21 @@ router.get(
         code: order.code,
         status: order.status,
         channel: order.channel,
-        
+
         subtotal: order.subtotal,
         discount: order.discount,
         extraFee: order.extraFee,
         total: order.total,
-        
-        hasFlashSaleItems: (order.items || []).some((it) => it.isFlashSale),
+
+        hasFlashSaleItems: itemsWithImage.some((it) => it.isFlashSale),
         totalSavings,
-        
-        items: order.items || [],
+
+        items: itemsWithImage,
         payments: order.payments || [],
         delivery: order.delivery || {},
-        
+
         customer: order.customerId || {},
-        
+
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
       },
@@ -397,7 +493,7 @@ router.get(
 
 /**
  * ===============================
- * GET /api/public/orders/track/:phone - Track orders by phone (no auth)
+ * GET /api/order-public/orders/track/:phone - Track orders by phone (no auth)
  * ===============================
  */
 router.get(
