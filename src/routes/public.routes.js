@@ -6,6 +6,7 @@ const Product = require("../models/Product");
 const ProductVariant = require("../models/ProductVariant");
 const Category = require("../models/Category");
 const FlashSale = require("../models/FlashSale");
+const Branch = require("../models/Branch");
 const { asyncHandler } = require("../utils/asyncHandler");
 
 const PRODUCT_VARIANTS_COLLECTION = "productvariants";
@@ -1588,5 +1589,38 @@ router.get(
     });
   })
 );
+
+// ===============================
+// GET /api/public/logo
+// ===============================
+
+router.get("/logo", async (req, res) => {
+  try {
+    console.log("GET BRAND LOGO REQUEST");
+    const branch = await Branch.findOne(
+      { isMain: true, isActive: true },
+      { logo: 1, brandName: 1, _id: 0 }
+    ).lean();
+
+    if (!branch || !branch.logo) {
+      return res.status(404).json({
+        success: false,
+        message: "Chưa cấu hình logo chi nhánh chính",
+      });
+    }
+
+    res.json({
+      success: true,
+      logo: branch.logo,
+      brandName: branch.brandName || "",
+    });
+  } catch (err) {
+    console.error("GET BRAND LOGO ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
+  }
+});
 
 module.exports = router;
